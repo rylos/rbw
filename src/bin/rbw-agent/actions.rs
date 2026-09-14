@@ -522,14 +522,17 @@ pub async fn sync(
         return Err(anyhow::anyhow!("failed to find refresh token in db"));
     };
     let (
-        access_token,
+        tokens,
         (protected_key, protected_private_key, protected_org_keys, entries),
     ) = rbw::actions::sync(&access_token, &refresh_token)
         .await
         .context("failed to sync database from server")?;
     state.lock().await.set_master_password_reprompt(&entries);
-    if let Some(access_token) = access_token {
-        db.access_token = Some(access_token);
+    if let Some(tokens) = tokens {
+        db.access_token = Some(tokens.access_token);
+        if let Some(refresh_token) = tokens.refresh_token {
+            db.refresh_token = Some(refresh_token);
+        }
     }
     db.protected_key = Some(protected_key);
     db.protected_private_key = Some(protected_private_key);
