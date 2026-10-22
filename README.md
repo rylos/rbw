@@ -1,68 +1,87 @@
 # rbw (enhanced fork)
 
-> This is the `enhanced` branch of [rylos/rbw](https://github.com/rylos/rbw), a
-> fork of [doy/rbw](https://github.com/doy/rbw). It adds full write support
-> (every field of an entry, folders, trash, attachments), an optional login that
-> never expires, and a few pending upstream pull requests. Read-only output
-> (`rbw list --raw`, `rbw get --raw`, ...) is unchanged apart from an extra
-> `attachments` key, so tools built on it, like
-> [rofi-rbw](https://github.com/fdw/rofi-rbw), keep working.
->
-> **What's different**
->
-> * `rbw add` and `rbw edit` work with current Vaultwarden (they send
->   `encryptedFor`) and handle every field: username, password, TOTP, URIs,
->   custom fields (text, hidden, boolean), folder and notes. Without options
->   they open an editor with all fields; with options they don't open anything:
->
->   ```sh
->   echo "$PW" | rbw add Example me --uri https://example.com --password-stdin \
->       --totp otpauth://... --field pin=1234 --hidden-field token=abc --folder Web
->   rbw add --secure-note Recipe --notes-file recipe.md
->   echo "$NEW" | rbw edit Example --password-stdin       # old password goes to the history
->   rbw edit Example --rename Example2 --move-to Archive --add-uri https://b.example
->   rbw edit Example --hidden-field token=new --remove-field pin --favorite true
->   ```
->
->   `rbw edit` fetches the entry from the server, re-encrypts only the values
->   that changed and sends everything else back untouched: passkeys,
->   attachments, favorites, archive state, per-item encryption keys and item
->   types rbw doesn't know about survive an edit. The server's revision check
->   rejects the write if the entry changed elsewhere in the meantime. Piping an
->   empty stdin into `rbw edit` is refused instead of wiping the password.
-> * `rbw rm` moves the entry to the trash. `rbw trash` lists it, `rbw restore
->   <name>` brings it back, and `rbw rm --permanent` deletes for good.
-> * `rbw folder list|add|rename|rm`.
-> * `rbw attachment list|get|add|rm <entry>`: `get` saves to the attachment's
->   name (or `-o file`, `-o -` for stdout), `add --file f` uploads (`--file -
->   --name n` from stdin). Attachments are encrypted in the agent with their own
->   key, exactly like the official clients do.
-> * **Persistent login** (`rbw config set persistent_login true`): rotated
->   refresh tokens are saved (doy/rbw#378), so with the hourly sync the login
->   is renewed continuously. If the server ever rejects the refresh token
->   anyway (more than 30 days offline on Vaultwarden, a server reset, ...), the
->   agent logs in again with your personal API key instead of asking for the
->   second factor. `rbw login` uses the API key too. The key is asked for with
->   the pinentry (prompts `API key client__id` and `API key client__secret`), so
->   a pinentry wrapper can answer from a keyring, and is kept in the agent's
->   memory for the next renewal. Find it in the web vault under *Settings →
->   Security → Keys → View API key*. Note that API key logins skip two factor
->   authentication: whoever has the key and the master password gets in.
-> * When the agent can no longer sync because the login expired it shows a
->   desktop notification (`notify-send`) once, instead of failing silently.
->   Turn it off with `rbw config set notify false`.
-> * Entries of types rbw can't display (bank accounts, passports, ...) are
->   listed as notes (name, notes and fields) instead of disappearing.
-> * Merged upstream pull requests: #378 (rotated refresh tokens), #359 (batched
->   decryption: `rbw list` and rofi-rbw are much faster on big vaults), #207
->   (timers keep working across suspend), #323 (`rbw inject` / `rbw run`),
->   #376, #332, #388 (maintenance).
->
-> The agent protocol is extended, so the fork's `rbw` and `rbw-agent` must be
-> used together; `rbw stop-agent` after installing.
->
-> `tests/vw/e2e.sh` runs the new commands against a throwaway Vaultwarden in
-> docker and checks every write with an independent decryptor.
+This is the `enhanced` branch of [rylos/rbw](https://github.com/rylos/rbw), a
+fork of [doy/rbw](https://github.com/doy/rbw) 1.15.0. It adds full write
+support, attachments and an optional login that never expires, and merges a
+few pending upstream pull requests. Read-only output (`rbw list --raw`,
+`rbw get --raw`, ...) is unchanged apart from an extra `attachments` key, so
+tools built on it, like [rofi-rbw](https://github.com/fdw/rofi-rbw), keep
+working. Tested against Vaultwarden 1.37.4. The changes were written with
+Claude Code; `tests/vw/e2e.sh` runs every new command against a throwaway
+Vaultwarden in docker and checks each write with an independent decryptor.
+
+### Added
+
+* **Edit every field.** `rbw add` and `rbw edit` set username, password,
+  TOTP, URIs, custom fields (text, hidden, boolean), folder and notes. Without
+  options they open an editor showing all fields; with options they don't open
+  anything (handy for scripts, #220, #365, #35):
+
+  ```sh
+  echo "$PW" | rbw add Example me --uri https://example.com --password-stdin \
+      --totp otpauth://... --field pin=1234 --hidden-field token=abc --folder Web
+  rbw add --secure-note Recipe --notes-file recipe.md
+  echo "$NEW" | rbw edit Example --password-stdin   # old password goes to the history
+  rbw edit Example --rename Example2 --move-to Archive --add-uri https://b.example
+  rbw edit Example --hidden-field token=new --remove-field pin --favorite true
+  ```
+* **Attachments** (#130): `rbw attachment list|get|add|rm <entry>`. `get`
+  saves to the attachment's name (or `-o file`, `-o -` for stdout), `add --file
+  f` uploads (`--file - --name n` from stdin), `rbw add --attach f`. Files are
+  encrypted in the agent with their own key, like the official clients do.
+* **Trash:** `rbw rm` moves the entry to the trash; `rbw trash` lists it,
+  `rbw restore <name>` brings it back, `rbw rm --permanent` deletes for good.
+* **Folders:** `rbw folder list|add|rename|rm`.
+* **Persistent login** (`rbw config set persistent_login true`): when the
+  server rejects the refresh token (on Vaultwarden it expires after 30 days
+  without a sync, #32), the agent logs in again with your personal API key
+  instead of asking for the second factor; `rbw login` uses it too. The key is
+  asked for with the pinentry (prompts `API key client__id` and `API key
+  client__secret`), so a wrapper can answer from a keyring (examples in
+  `contrib/`), and is kept in the agent's memory. Find it in the web vault under
+  *Settings → Security → Keys → View API key*. API key logins skip two factor
+  authentication.
+* **Desktop notification** (`notify-send`, once) when the agent can no longer
+  sync because the login expired, instead of failing silently (`rbw config set
+  notify false` turns it off).
+
+### Changed
+
+* `rbw edit` fetches the entry from the server, re-encrypts only the values
+  that changed and sends everything else back untouched: passkeys,
+  attachments, favorites, archive state, per-item keys and item types rbw
+  doesn't know about survive an edit. The server's revision check rejects the
+  write if the entry changed elsewhere in the meantime. Nothing is written when
+  nothing changed (#21).
+* `rbw rm` moves to the trash (see above).
+* Token refreshes requested by the client go through the agent.
+* Entries of types rbw can't display (bank accounts, passports, driver's
+  licenses) are listed as notes instead of disappearing.
+* The agent protocol is extended, so the fork's `rbw` and `rbw-agent` must be
+  used together (`rbw stop-agent` after installing).
+
+### Fixed
+
+* `rbw add` and `rbw edit` failed with 422 on Vaultwarden 1.34+: they now send
+  `encryptedFor` and `lastKnownRevisionDate` (#385).
+* `rbw edit` corrupted entries with an individual encryption key (#364) and
+  dropped their passkeys, reprompt setting and archive state.
+* `rbw edit` with a non-tty, empty stdin wiped the password and notes; it now
+  refuses (#377).
+* Notes lines starting with `#` were dropped when editing; the new editor
+  keeps them.
+
+### Merged upstream pull requests
+
+* #378 persist rotated refresh tokens, stop retrying a rejected one
+* #359 batched decryption (`rbw list` and rofi-rbw are much faster on big
+  vaults)
+* #207 sync and lock timers keep working across system sleep
+* #323 `rbw inject` and `rbw run`
+* #376, #332, #388 lints and RUSTSEC fixes, no panic on disconnected clients,
+  pinentry over ssh
+
+---
 
 This is an unofficial command line client for
 [Bitwarden](https://bitwarden.com/). Although Bitwarden does come with its own
