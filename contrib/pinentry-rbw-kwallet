@@ -1,0 +1,93 @@
+#!/bin/bash
+# Pinentry wrapper per rbw.
+#
+# Risponde da solo alla richiesta della master password, leggendola da KWallet
+# via secret-tool, così rbw non chiede nulla all'utente.
+#
+# ⚠️ L'account ha il 2FA TOTP attivo, e rbw usa lo *stesso* pinentry anche per
+# chiedere il codice a sei cifre. La prima versione di questo script rispondeva
+# con la master password a qualunque GETPIN: al codice 2FA rbw riceveva la
+# password e falliva con "TOTP code is not a number". Il login non riusciva
+# più, e siccome nel frattempo scadeva anche il refresh token, `rbw sync`
+# rispondeva "missing field access_token" — il vault locale è rimasto fermo
+# dal 25/06/2026 al 29/08/2026 senza che niente lo segnalasse.
+#
+# Perciò ora si guarda cosa viene chiesto: la descrizione arriva nei comandi
+# SETDESC/SETPROMPT del protocollo Assuan, prima della GETPIN.
+#
+# Con rbw-enhanced e `persistent_login true` rbw chiede anche la API key
+# personale ("API key client__id" / "API key client__secret") per rifare il
+# login senza 2FA quando il refresh token non vale più. Si legge da KWallet:
+#   secret-tool store --label="rbw api key client_id" service rbw account apikey-client-id
+#   secret-tool store --label="rbw api key client_secret" service rbw account apikey-client-secret
+# Se non c'è, si annulla: rbw ripiega sul login normale con password e 2FA.
+# Prima di questo ramo a quelle domande si rispondeva con la master password.
+
+PASSWORD=$(secret-tool lookup service rbw account master 2>/dev/null)
+# Assuan vuole % codificato come %25 (rbw lo decodifica): senza, una password
+# con "%41" arriverebbe come "A".
+PASSWORD_D=$(printf '%s' "$PASSWORD" | sed 's/%/%25/g')
+
+if [ -z "$PASSWORD" ]; then
+    exec pinentry "$@"
+fi
+
+# Chiede un valore all'utente con una finestra vera, per ciò che non si può
+# leggere dal wallet (il codice 2FA).
+ask_user() {
+    local prompt=$1
+    if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] && command -v pinentry-qt >/dev/null; then
+        printf 'SETTITLE rbw\nSETDESC %s\nSETPROMPT Codice:\nGETPIN\nBYE\n' "$prompt" |
+            pinentry-qt 2>/dev/null | sed -n 's/^D //p' | head -1
+    elif command -v kdialog >/dev/null; then
+        kdialog --title rbw --inputbox "$prompt" 2>/dev/null
+    fi
+}
+
+desc=""
+echo "OK Pleased to meet you"
+while IFS= read -r line; do
+    case "$line" in
+        SETDESC*|SETPROMPT*|SETTITLE*)
+            desc="$desc ${line#* }"
+            echo "OK"
+            ;;
+        GETPIN*)
+            # rbw chiede il codice a due fattori con una descrizione che lo
+            # nomina esplicitamente; tutto il resto è la master password.
+            if printf '%s' "$desc" | grep -qiE 'client_+id|client_+secret'; then
+                if printf '%s' "$desc" | grep -qiE 'client_+id'; then
+                    value=$(secret-tool lookup service rbw account apikey-client-id 2>/dev/null)
+                else
+                    value=$(secret-tool lookup service rbw account apikey-client-secret 2>/dev/null)
+                fi
+                value=$(printf '%s' "$value" | sed 's/%/%25/g')
+                if [ -n "$value" ]; then
+                    echo "D $value"
+                    echo "OK"
+                else
+                    echo "ERR 83886179 Operation cancelled"
+                fi
+            elif printf '%s' "$desc" | grep -qiE 'two.?factor|two.?step|2fa|totp|authenticator|verification code'; then
+                code=$(ask_user "Codice a due fattori di Bitwarden")
+                if [ -n "$code" ]; then
+                    echo "D $code"
+                    echo "OK"
+                else
+                    echo "ERR 83886179 Operation cancelled"
+                fi
+            else
+                echo "D $PASSWORD_D"
+                echo "OK"
+            fi
+            desc=""
+            ;;
+        BYE*)
+            echo "OK closing connection"
+            exit 0
+            ;;
+        *)
+            echo "OK"
+            ;;
+    esac
+done

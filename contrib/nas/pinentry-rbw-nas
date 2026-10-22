@@ -1,0 +1,58 @@
+#!/bin/sh
+# Pinentry per rbw su un host senza portachiavi (NAS Synology).
+#
+# Risponde da solo alla master password e alla API key leggendole da file
+# cifrati con openssl; la chiave sta in un'altra cartella. È offuscamento, non
+# protezione vera: chi legge l'account legge anche la chiave. Serve a non avere
+# segreti in chiaro su disco e nei backup della sola ~/.config.
+#
+#   rbw-nas-secret set master|apikey-client-id|apikey-client-secret   (valore da stdin)
+#
+# Il codice 2FA non si può rispondere da qui: si annulla, e con
+# persistent_login rbw usa la API key, che il 2FA non lo chiede.
+
+DIR=${RBW_NAS_SECRETS:-$HOME/.config/rbw/secrets}
+KEY=${RBW_NAS_KEY:-$HOME/.local/share/rbw/secrets.key}
+
+secret() {
+    [ -r "$DIR/$1.enc" ] && [ -r "$KEY" ] || return 1
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "file:$KEY" -in "$DIR/$1.enc" 2>/dev/null
+}
+
+answer() {
+    # Assuan vuole % codificato come %25 (rbw lo decodifica)
+    value=$(secret "$1" | sed 's/%/%25/g')
+    if [ -n "$value" ]; then
+        printf 'D %s\nOK\n' "$value"
+    else
+        echo "ERR 83886179 Operation cancelled"
+    fi
+}
+
+desc=""
+echo "OK Pleased to meet you"
+while IFS= read -r line; do
+    case "$line" in
+        SETDESC*|SETPROMPT*|SETTITLE*)
+            desc="$desc ${line#* }"
+            echo "OK"
+            ;;
+        GETPIN*)
+            case "$desc" in
+                *client__id*|*client_id*) answer apikey-client-id ;;
+                *client__secret*|*client_secret*) answer apikey-client-secret ;;
+                *[Tt]wo*[Ff]actor*|*2FA*|*TOTP*|*[Aa]uthenticator*|*[Vv]erification*)
+                    echo "ERR 83886179 Operation cancelled" ;;
+                *) answer master ;;
+            esac
+            desc=""
+            ;;
+        BYE*)
+            echo "OK closing connection"
+            exit 0
+            ;;
+        *)
+            echo "OK"
+            ;;
+    esac
+done
