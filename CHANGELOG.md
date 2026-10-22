@@ -30,7 +30,8 @@
 * `rbw add` and `rbw edit` failed with 422 on Vaultwarden 1.34+ (missing
   `encryptedFor`).
 * Editing an entry with its own encryption key corrupted it.
-* Editing an entry dropped its passkeys, favorite flag and reprompt setting.
+* Editing an entry dropped its passkeys, its reprompt setting and its
+  archive state.
 
 ## [1.15.0] - 2025-12-31
 
