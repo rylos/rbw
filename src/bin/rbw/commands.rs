@@ -3020,7 +3020,7 @@ impl InjectContext {
 
     fn resolve(&self, reference: &InjectReference) -> anyhow::Result<String> {
         let (entry, _) = self.find_entry_raw(&reference.target)?;
-        let decrypted = decrypt_cipher(&entry).with_context(|| {
+        let decrypted = decrypt_cipher_batched(&entry).with_context(|| {
             format!("failed to decrypt entry '{}'", reference.id)
         })?;
         resolve_inject_value(&decrypted, reference.field.as_deref())
@@ -3036,14 +3036,11 @@ impl InjectContext {
         &self,
         target: &InjectReferenceTarget,
     ) -> anyhow::Result<(rbw::db::Entry, DecryptedSearchCipher)> {
-        let entries = self
-            .entries
-            .iter()
-            .map(|entry| {
-                decrypt_search_cipher(entry)
-                    .map(|decrypted| (entry.clone(), decrypted))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let decrypted = batch_decrypt(&self.entries, |entry, decryptor| {
+            decrypt_search_cipher(entry, decryptor)
+        })?;
+        let entries: Vec<_> =
+            self.entries.iter().cloned().zip(decrypted).collect();
         target.find_entry(&entries)
     }
 }
