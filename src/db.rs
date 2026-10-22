@@ -253,7 +253,8 @@ impl Db {
         Ok(slf)
     }
 
-    // XXX need to make this atomic
+    // written to a temporary file and renamed over the old one, so a
+    // concurrent load never sees a truncated or half written file
     pub fn save(&self, server: &str, email: &str) -> Result<()> {
         let file = crate::dirs::db_file(server, email);
         // unwrap is safe here because Self::filename is explicitly
@@ -264,24 +265,17 @@ impl Db {
                 file: file.clone(),
             },
         )?;
-        let mut fh =
-            std::fs::File::create(&file).map_err(|source| Error::SaveDb {
+        let json = serde_json::to_string(self).map_err(|source| {
+            Error::SaveDbJson {
                 source,
                 file: file.clone(),
-            })?;
-        fh.write_all(
-            serde_json::to_string(self)
-                .map_err(|source| Error::SaveDbJson {
-                    source,
-                    file: file.clone(),
-                })?
-                .as_bytes(),
-        )
-        .map_err(|source| Error::SaveDb { source, file })?;
+            }
+        })?;
+        write_atomic(&file, json.as_bytes())
+            .map_err(|source| Error::SaveDb { source, file })?;
         Ok(())
     }
 
-    // XXX need to make this atomic
     pub async fn save_async(&self, server: &str, email: &str) -> Result<()> {
         let file = crate::dirs::db_file(server, email);
         // unwrap is safe here because Self::filename is explicitly
@@ -292,23 +286,15 @@ impl Db {
                 source,
                 file: file.clone(),
             })?;
-        let mut fh =
-            tokio::fs::File::create(&file).await.map_err(|source| {
-                Error::SaveDbAsync {
-                    source,
-                    file: file.clone(),
-                }
-            })?;
-        fh.write_all(
-            serde_json::to_string(self)
-                .map_err(|source| Error::SaveDbJson {
-                    source,
-                    file: file.clone(),
-                })?
-                .as_bytes(),
-        )
-        .await
-        .map_err(|source| Error::SaveDbAsync { source, file })?;
+        let json = serde_json::to_string(self).map_err(|source| {
+            Error::SaveDbJson {
+                source,
+                file: file.clone(),
+            }
+        })?;
+        write_atomic_async(&file, json.as_bytes())
+            .await
+            .map_err(|source| Error::SaveDbAsync { source, file })?;
         Ok(())
     }
 
@@ -330,5 +316,111 @@ impl Db {
             || self.iterations.is_none()
             || self.kdf.is_none()
             || self.protected_key.is_none()
+    }
+}
+
+// unique per process and per call: the agent can save from several tasks
+// at once, and each needs its own temporary file
+fn tmp_file(file: &std::path::Path) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = std::ffi::OsString::from(".");
+    tmp.push(file.file_name().unwrap_or_else(|| "db".as_ref()));
+    tmp.push(format!(".{}.{n}.tmp", std::process::id()));
+    file.with_file_name(tmp)
+}
+
+fn write_atomic(file: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_file(file);
+    let res = (|| {
+        let mut fh = std::fs::File::create(&tmp)?;
+        fh.write_all(data)?;
+        fh.sync_all()?;
+        std::fs::rename(&tmp, file)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+async fn write_atomic_async(
+    file: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let tmp = tmp_file(file);
+    let res = async {
+        let mut fh = tokio::fs::File::create(&tmp).await?;
+        fh.write_all(data).await?;
+        fh.sync_all().await?;
+        tokio::fs::rename(&tmp, file).await
+    }
+    .await;
+    if res.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    res
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("rbw-db-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_write_atomic_never_exposes_partial_file() {
+        const LEN: usize = 4 * 1024 * 1024;
+        let dir = test_dir("sync");
+        let file = dir.join("db.json");
+        write_atomic(&file, &vec![b'a'; LEN]).unwrap();
+        let reader = {
+            let file = file.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let data = std::fs::read(&file).unwrap();
+                    assert_eq!(data.len(), LEN);
+                    assert!(data.iter().all(|&c| c == data[0]));
+                }
+            })
+        };
+        for i in 0..20_u8 {
+            write_atomic(&file, &vec![b'a' + i % 2; LEN]).unwrap();
+        }
+        reader.join().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("db.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_atomic_async_concurrent_writers() {
+        const LEN: usize = 256 * 1024;
+        let dir = test_dir("async");
+        let file = dir.join("db.json");
+        let mut tasks = vec![];
+        for i in 0..16_u8 {
+            let file = file.clone();
+            tasks.push(tokio::spawn(async move {
+                write_atomic_async(&file, &vec![i; LEN]).await.unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let data = std::fs::read(&file).unwrap();
+        assert_eq!(data.len(), LEN);
+        assert!(data.iter().all(|&c| c == data[0]));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

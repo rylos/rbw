@@ -70,6 +70,11 @@ an independent decryptor.
   refuses (#377).
 * Notes lines starting with `#` were dropped when editing; the new editor
   keeps them.
+* The agent rewrote its cache in place, so a command reading it at the same
+  moment failed with `EOF while parsing`, and the agent itself took the
+  half-written file for "not logged in" and asked for the master password
+  and the 2FA code again. The cache is now replaced atomically, and only a
+  missing file means logged out.
 
 ### Merged upstream pull requests
 

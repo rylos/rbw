@@ -4,7 +4,7 @@ pub async fn register(
     sock: &mut crate::sock::Sock,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    let db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
+    let db = load_db_or_new().await?;
 
     if db.needs_login() {
         let url_str = config_base_url().await?;
@@ -79,7 +79,7 @@ pub async fn login(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    let db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
+    let db = load_db_or_new().await?;
 
     if db.needs_login() && config_persistent_login().await? {
         // the api key skips two factor authentication; the master password
@@ -100,7 +100,7 @@ pub async fn login(
         }
     }
 
-    let db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
+    let db = load_db_or_new().await?;
 
     if db.needs_login() {
         let url_str = config_base_url().await?;
@@ -1001,7 +1001,7 @@ async fn api_key_login(
         }
     };
 
-    let mut db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
+    let mut db = load_db_or_new().await?;
     db.access_token = Some(login.access_token.clone());
     db.refresh_token = None;
     db.api_key_login = true;
@@ -1143,6 +1143,25 @@ async fn load_db() -> anyhow::Result<rbw::db::Db> {
             .map_err(anyhow::Error::new)
     } else {
         Err(anyhow::anyhow!("failed to find email address in config"))
+    }
+}
+
+// a missing db means we were never logged in. Any other error (a file we
+// can't read, invalid json) must not be taken for that: the agent would
+// start an interactive login and overwrite the cached vault
+async fn load_db_or_new() -> anyhow::Result<rbw::db::Db> {
+    match load_db().await {
+        Ok(db) => Ok(db),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<rbw::error::Error>(),
+                Some(rbw::error::Error::LoadDbAsync { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(rbw::db::Db::new())
+        }
+        Err(e) => Err(e),
     }
 }
 

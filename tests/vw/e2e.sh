@@ -144,6 +144,35 @@ r = Rbw()
 print(sum(1 for e in r.list_entries() if r.fetch_credentials(e)))')"
 fi
 
+echo "== concurrent writes and reads"
+# every save of the agent used to truncate the cache before writing it: a
+# command reading it in that moment failed with "EOF while parsing", and the
+# agent took the unreadable file for "not logged in" and started a new
+# interactive login (master password and 2fa) while the vault was in use
+printf '#!/bin/sh\necho call >> %s/pinentry.log\nexec %s "$@"\n' "$WORK" "$ROOT/tests/vw/pinentry-test" >"$WORK/bin/pinentry-log"
+chmod +x "$WORK/bin/pinentry-log"
+rbw config set pinentry "$WORK/bin/pinentry-log"
+rbw unlock    # config set stops the agent: start it before counting prompts
+: >"$WORK/pinentry.log"
+(while [ ! -e "$WORK/stop" ]; do
+    rbw list >/dev/null 2>>"$WORK/readers.err" || echo list >>"$WORK/readers.fail"
+    rbw get flags >/dev/null 2>>"$WORK/readers.err" || echo get >>"$WORK/readers.fail"
+done) &
+(while [ ! -e "$WORK/stop" ]; do
+    rbw sync 2>>"$WORK/readers.err" || echo sync >>"$WORK/readers.fail"
+done) &
+for i in $(seq 1 40); do
+    rbw edit flags --add-uri "https://s$i.example" 2>>"$WORK/writers.err" || echo "edit $i" >>"$WORK/writers.fail"
+done
+touch "$WORK/stop"
+wait
+check "no command failed while the cache was rewritten" 0 "$(cat "$WORK/readers.fail" "$WORK/writers.fail" 2>/dev/null | wc -l)"
+check "no login prompt while the vault was in use" 0 "$(wc -l <"$WORK/pinentry.log")"
+check "every concurrent edit landed" 40 "$(item flags '.login.uris | length')"
+check "no temporary files left next to the cache" 1 "$(find "$HOME/.cache/rbw-rbwtest" -maxdepth 1 -type f | wc -l)"
+cat "$WORK/readers.err" "$WORK/writers.err" 2>/dev/null | sort | uniq -c | head -5
+rbw config set pinentry "$ROOT/tests/vw/pinentry-test"
+
 echo "== expired login"
 rbw config set persistent_login false
 setdb '.access_token="x.eyJzdWIiOiJ4In0.x" | .refresh_token="garbage"'
