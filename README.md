@@ -6,9 +6,9 @@ support, attachments and an optional login that never expires, and merges a
 few pending upstream pull requests. Read-only output (`rbw list --raw`,
 `rbw get --raw`, ...) is unchanged apart from an extra `attachments` key, so
 tools built on it, like [rofi-rbw](https://github.com/fdw/rofi-rbw), keep
-working. Tested against Vaultwarden 1.37.4. The changes were written with
-Claude Code; `tests/vw/e2e.sh` runs every new command against a throwaway
-Vaultwarden in docker and checks each write with an independent decryptor.
+working. Tested against Vaultwarden 1.37.4: `tests/vw/e2e.sh` runs every new
+command against a throwaway Vaultwarden in docker and checks each write with
+an independent decryptor.
 
 ### Added
 
