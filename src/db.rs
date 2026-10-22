@@ -19,6 +19,19 @@ pub struct Entry {
     pub history: Vec<HistoryEntry>,
     pub key: Option<String>,
     pub master_password_reprompt: crate::api::CipherRepromptType,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
+pub struct Attachment {
+    pub id: String,
+    // encrypted, like the key
+    pub file_name: Option<String>,
+    pub size: Option<String>,
+    pub key: Option<String>,
 }
 
 impl Entry {
@@ -188,6 +201,11 @@ pub struct Db {
     pub protected_private_key: Option<String>,
     pub protected_org_keys: std::collections::HashMap<String, String>,
 
+    // the current access token came from an api key login, which doesn't
+    // provide a refresh token
+    #[serde(default)]
+    pub api_key_login: bool,
+
     pub entries: Vec<Entry>,
 }
 
@@ -308,7 +326,7 @@ impl Db {
 
     pub fn needs_login(&self) -> bool {
         self.access_token.is_none()
-            || self.refresh_token.is_none()
+            || (self.refresh_token.is_none() && !self.api_key_login)
             || self.iterations.is_none()
             || self.kdf.is_none()
             || self.protected_key.is_none()

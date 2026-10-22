@@ -130,12 +130,21 @@ pub fn encrypt(
     plaintext: &str,
     org_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    encrypt_for_entry(plaintext, None, org_id)
+}
+
+pub fn encrypt_for_entry(
+    plaintext: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<String> {
     let mut sock = connect()?;
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
         rbw::protocol::Action::Encrypt {
             plaintext: plaintext.to_string(),
             org_id: org_id.map(std::string::ToString::to_string),
+            entry_key: entry_key.map(std::string::ToString::to_string),
         },
     ))?;
 
@@ -147,6 +156,69 @@ pub fn encrypt(
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
+}
+
+// returns the new attachment's encrypted key and its encrypted contents
+pub fn encrypt_attachment(
+    data: &[u8],
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<(String, Vec<u8>)> {
+    let mut sock = connect()?;
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::EncryptAttachment {
+            data: rbw::base64::encode(data),
+            entry_key: entry_key.map(std::string::ToString::to_string),
+            org_id: org_id.map(std::string::ToString::to_string),
+        },
+    ))?;
+
+    let res = sock.recv()?;
+    match res {
+        rbw::protocol::Response::EncryptAttachment { key, data } => Ok((
+            key,
+            rbw::base64::decode(data)
+                .context("agent returned invalid base64")?,
+        )),
+        rbw::protocol::Response::Error { error } => {
+            Err(anyhow::anyhow!("failed to encrypt attachment: {error}"))
+        }
+        _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
+pub fn decrypt_attachment(
+    data: &[u8],
+    key: Option<&str>,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut sock = connect()?;
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::DecryptAttachment {
+            data: rbw::base64::encode(data),
+            key: key.map(std::string::ToString::to_string),
+            entry_key: entry_key.map(std::string::ToString::to_string),
+            org_id: org_id.map(std::string::ToString::to_string),
+        },
+    ))?;
+
+    let res = sock.recv()?;
+    match res {
+        rbw::protocol::Response::DecryptAttachment { data } => {
+            rbw::base64::decode(data).context("agent returned invalid base64")
+        }
+        rbw::protocol::Response::Error { error } => {
+            Err(anyhow::anyhow!("failed to decrypt attachment: {error}"))
+        }
+        _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
+pub fn refresh_token() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::RefreshToken)
 }
 
 pub fn clipboard_store(text: &str) -> anyhow::Result<()> {

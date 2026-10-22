@@ -212,6 +212,66 @@ impl CipherString {
     }
 }
 
+// Attachments are not stored as cipherstrings but as raw bytes: the
+// encryption type, then the iv, the mac and the ciphertext.
+pub fn encrypt_bytes(
+    keys: &crate::locked::Keys,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let CipherString::Symmetric {
+        iv,
+        ciphertext,
+        mac: Some(mac),
+    } = CipherString::encrypt_symmetric(keys, plaintext)?
+    else {
+        unreachable!()
+    };
+    let mut res =
+        Vec::with_capacity(1 + iv.len() + mac.len() + ciphertext.len());
+    res.push(2);
+    res.extend_from_slice(&iv);
+    res.extend_from_slice(&mac);
+    res.extend_from_slice(&ciphertext);
+    Ok(res)
+}
+
+pub fn decrypt_bytes(
+    keys: &crate::locked::Keys,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    match data.first() {
+        Some(2) if data.len() > 1 + 16 + 32 => {}
+        Some(2) => {
+            return Err(Error::InvalidCipherString {
+                reason: "encrypted attachment is too short".to_string(),
+            })
+        }
+        Some(ty) => {
+            return Err(Error::UnimplementedCipherStringType {
+                ty: ty.to_string(),
+            })
+        }
+        None => {
+            return Err(Error::InvalidCipherString {
+                reason: "encrypted attachment is empty".to_string(),
+            })
+        }
+    }
+    CipherString::Symmetric {
+        iv: data[1..17].to_vec(),
+        mac: Some(data[17..49].to_vec()),
+        ciphertext: data[49..].to_vec(),
+    }
+    .decrypt_symmetric(keys, None)
+}
+
+pub fn random_key() -> crate::locked::Keys {
+    let mut key = crate::locked::Vec::new();
+    key.extend(std::iter::repeat_n(0, 64));
+    rand::rng().fill_bytes(key.data_mut());
+    crate::locked::Keys::new(key)
+}
+
 fn decrypt_common_symmetric(
     keys: &crate::locked::Keys,
     iv: &[u8],
@@ -290,6 +350,19 @@ fn pkcs7_unpad(b: &[u8]) -> Option<&[u8]> {
     }
 
     Some(&b[..b.len() - padding_len])
+}
+
+#[test]
+fn test_bytes_roundtrip() {
+    let keys = random_key();
+    let plaintext = b"attachment contents \x00\x01\x02";
+    let encrypted = encrypt_bytes(&keys, plaintext).unwrap();
+    assert_eq!(encrypted[0], 2);
+    assert_eq!(decrypt_bytes(&keys, &encrypted).unwrap(), plaintext);
+    let mut tampered = encrypted.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(decrypt_bytes(&keys, &tampered).is_err());
+    assert!(decrypt_bytes(&random_key(), &encrypted).is_err());
 }
 
 #[test]

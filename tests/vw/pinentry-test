@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake pinentry for tests: answers every GETPIN with $RBW_TEST_PIN (default: test password),
+# or with $RBW_TEST_APIKEY_ID / _SECRET when the prompt mentions client id / secret.
+echo "OK Pleased to meet you"
+desc=""
+while IFS= read -r line; do
+  case "$line" in
+    SETPROMPT*|SETDESC*) desc="$desc $line"; echo OK ;;
+    GETPIN*)
+      case "$desc" in
+        *client_id*|*"client id"*|*"Client ID"*) echo "D ${RBW_TEST_APIKEY_ID}" ;;
+        *client_secret*|*"client secret"*|*"Client Secret"*) echo "D ${RBW_TEST_APIKEY_SECRET}" ;;
+        *) echo "D ${RBW_TEST_PIN:-test-password-123}" ;;
+      esac
+      desc=""; echo OK ;;
+    BYE*) echo "OK closing connection"; exit 0 ;;
+    *) echo OK ;;
+  esac
+done

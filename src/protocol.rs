@@ -15,7 +15,12 @@ pub const VERSION: u32 = {
     unwrap(&u32::from_str_radix(major, 10)) * 1_000_000
         + unwrap(&u32::from_str_radix(minor, 10)) * 1_000_000
         + unwrap(&u32::from_str_radix(patch, 10)) * 1_000_000
+        + FORK_PROTOCOL
 };
+
+// the enhanced fork extends the protocol, so its agent must never be mixed
+// with an upstream client of the same version (or the other way around)
+const FORK_PROTOCOL: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Request {
@@ -196,7 +201,30 @@ pub enum Action {
     Encrypt {
         plaintext: String,
         org_id: Option<String>,
+        // entries with their own encryption key must have every value
+        // encrypted with that key instead of the user or organization key
+        #[serde(default)]
+        entry_key: Option<String>,
     },
+    // encrypt the contents of a new attachment with a freshly generated
+    // attachment key; data is base64
+    EncryptAttachment {
+        data: String,
+        entry_key: Option<String>,
+        org_id: Option<String>,
+    },
+    // decrypt the contents of an attachment; data is base64 and key is the
+    // attachment's own (encrypted) key
+    DecryptAttachment {
+        data: String,
+        // very old attachments have no key of their own
+        key: Option<String>,
+        entry_key: Option<String>,
+        org_id: Option<String>,
+    },
+    // get a new access token, from the refresh token or, with
+    // persistent_login, from the api key
+    RefreshToken,
     ClipboardStore {
         text: String,
     },
@@ -215,9 +243,26 @@ pub struct DecryptItem {
 #[serde(tag = "type")]
 pub enum Response {
     Ack,
-    Error { error: String },
-    Decrypt { plaintext: String },
-    DecryptMany { plaintexts: Vec<Result<String, String>> },
-    Encrypt { cipherstring: String },
-    Version { version: u32 },
+    Error {
+        error: String,
+    },
+    Decrypt {
+        plaintext: String,
+    },
+    DecryptMany {
+        plaintexts: Vec<Result<String, String>>,
+    },
+    Encrypt {
+        cipherstring: String,
+    },
+    EncryptAttachment {
+        key: String,
+        data: String,
+    },
+    DecryptAttachment {
+        data: String,
+    },
+    Version {
+        version: u32,
+    },
 }

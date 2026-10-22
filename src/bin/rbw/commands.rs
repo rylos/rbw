@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::Read as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::{fmt::Write as _, io::Write as _, os::unix::ffi::OsStrExt as _};
+use std::{io::Write as _, os::unix::ffi::OsStrExt as _};
 
 use anyhow::Context as _;
 
@@ -341,7 +341,7 @@ impl From<DecryptedSearchCipher> for DecryptedListCipher {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
-struct DecryptedCipher {
+pub(crate) struct DecryptedCipher {
     id: String,
     folder: Option<String>,
     name: String,
@@ -349,6 +349,16 @@ struct DecryptedCipher {
     fields: Vec<DecryptedField>,
     notes: Option<String>,
     history: Vec<DecryptedHistoryEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) attachments: Vec<DecryptedAttachment>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(test, derive(Eq, PartialEq))]
+pub(crate) struct DecryptedAttachment {
+    pub(crate) id: String,
+    pub(crate) file_name: Option<String>,
+    pub(crate) size: Option<String>,
 }
 
 impl DecryptedCipher {
@@ -1220,17 +1230,6 @@ impl std::convert::TryFrom<&String> for ListField {
     }
 }
 
-const HELP_PW: &str = r"
-# The first line of this file will be the password, and the remainder of the
-# file (after any blank lines after the password) will be stored as a note.
-# Lines with leading # will be ignored.
-";
-
-const HELP_NOTES: &str = r"
-# The content of this file will be stored as a note.
-# Lines with leading # will be ignored.
-";
-
 pub fn config_show() -> anyhow::Result<()> {
     let config = rbw::config::Config::load()?;
     serde_json::to_writer_pretty(std::io::stdout(), &config)
@@ -1273,6 +1272,14 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.sync_interval = interval;
         }
         "pinentry" => config.pinentry = value.to_string(),
+        "persistent_login" => {
+            config.persistent_login = parse_bool(value)
+                .context("failed to parse value for persistent_login")?;
+        }
+        "notify" => {
+            config.notify = parse_bool(value)
+                .context("failed to parse value for notify")?;
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1302,6 +1309,8 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
             config.lock_timeout = rbw::config::default_lock_timeout();
         }
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
+        "persistent_login" => config.persistent_login = false,
+        "notify" => config.notify = rbw::config::default_notify(),
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1314,6 +1323,14 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
     stop_agent()?;
 
     Ok(())
+}
+
+fn parse_bool(value: &str) -> anyhow::Result<bool> {
+    match value {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(anyhow::anyhow!("expected true or false, got '{value}'")),
+    }
 }
 
 fn clipboard_store(val: &str) -> anyhow::Result<()> {
@@ -1554,116 +1571,6 @@ pub fn code(
     Ok(())
 }
 
-pub fn add(
-    name: &str,
-    username: Option<&str>,
-    uris: &[(String, Option<rbw::api::UriMatchType>)],
-    folder: Option<&str>,
-) -> anyhow::Result<()> {
-    unlock()?;
-
-    let mut db = load_db()?;
-    // unwrap is safe here because the call to unlock above is guaranteed to
-    // populate these or error
-    let mut access_token = db.access_token.as_ref().unwrap().clone();
-    let mut refresh_token = db.refresh_token.as_ref().unwrap().clone();
-
-    let name = crate::actions::encrypt(name, None)?;
-
-    let username = username
-        .map(|username| crate::actions::encrypt(username, None))
-        .transpose()?;
-
-    let contents = rbw::edit::edit("", HELP_PW)?;
-
-    let (password, notes) = parse_editor(&contents);
-    let password = password
-        .map(|password| crate::actions::encrypt(&password, None))
-        .transpose()?;
-    let notes = notes
-        .map(|notes| crate::actions::encrypt(&notes, None))
-        .transpose()?;
-    let uris: Vec<_> = uris
-        .iter()
-        .map(|uri| {
-            Ok(rbw::db::Uri {
-                uri: crate::actions::encrypt(&uri.0, None)?,
-                match_type: uri.1,
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    let mut folder_id = None;
-    if let Some(folder_name) = folder {
-        let (tokens, folders) =
-            rbw::actions::list_folders(&access_token, &refresh_token)?;
-        if let Some(tokens) = tokens {
-            access_token = tokens.access_token;
-            db.access_token = Some(access_token.clone());
-            if let Some(new_refresh_token) = tokens.refresh_token {
-                refresh_token = new_refresh_token;
-                db.refresh_token = Some(refresh_token.clone());
-            }
-            save_db(&db)?;
-        }
-
-        let folders: Vec<(String, String)> = folders
-            .iter()
-            .cloned()
-            .map(|(id, name)| {
-                Ok((id, crate::actions::decrypt(&name, None, None)?))
-            })
-            .collect::<anyhow::Result<_>>()?;
-
-        for (id, name) in folders {
-            if name == folder_name {
-                folder_id = Some(id);
-            }
-        }
-        if folder_id.is_none() {
-            let (tokens, id) = rbw::actions::create_folder(
-                &access_token,
-                &refresh_token,
-                &crate::actions::encrypt(folder_name, None)?,
-            )?;
-            if let Some(tokens) = tokens {
-                access_token = tokens.access_token;
-                db.access_token = Some(access_token.clone());
-                if let Some(new_refresh_token) = tokens.refresh_token {
-                    refresh_token = new_refresh_token;
-                    db.refresh_token = Some(refresh_token.clone());
-                }
-                save_db(&db)?;
-            }
-            folder_id = Some(id);
-        }
-    }
-
-    if let (Some(tokens), ()) = rbw::actions::add(
-        &access_token,
-        &refresh_token,
-        &name,
-        &rbw::db::EntryData::Login {
-            username,
-            password,
-            uris,
-            totp: None,
-        },
-        notes.as_deref(),
-        folder_id.as_deref(),
-    )? {
-        db.access_token = Some(tokens.access_token);
-        if let Some(refresh_token) = tokens.refresh_token {
-            db.refresh_token = Some(refresh_token);
-        }
-        save_db(&db)?;
-    }
-
-    crate::actions::sync()?;
-
-    Ok(())
-}
-
 pub fn generate(
     name: Option<&str>,
     username: Option<&str>,
@@ -1676,261 +1583,20 @@ pub fn generate(
     println!("{password}");
 
     if let Some(name) = name {
-        unlock()?;
-
-        let mut db = load_db()?;
-        // unwrap is safe here because the call to unlock above is guaranteed
-        // to populate these or error
-        let mut access_token = db.access_token.as_ref().unwrap().clone();
-        let mut refresh_token = db.refresh_token.as_ref().unwrap().clone();
-
-        let name = crate::actions::encrypt(name, None)?;
-        let username = username
-            .map(|username| crate::actions::encrypt(username, None))
-            .transpose()?;
-        let password = crate::actions::encrypt(&password, None)?;
-        let uris: Vec<_> = uris
-            .iter()
-            .map(|uri| {
-                Ok(rbw::db::Uri {
-                    uri: crate::actions::encrypt(&uri.0, None)?,
-                    match_type: uri.1,
-                })
-            })
-            .collect::<anyhow::Result<_>>()?;
-
-        let mut folder_id = None;
-        if let Some(folder_name) = folder {
-            let (tokens, folders) =
-                rbw::actions::list_folders(&access_token, &refresh_token)?;
-            if let Some(tokens) = tokens {
-                access_token = tokens.access_token;
-                db.access_token = Some(access_token.clone());
-                if let Some(new_refresh_token) = tokens.refresh_token {
-                    refresh_token = new_refresh_token;
-                    db.refresh_token = Some(refresh_token.clone());
-                }
-                save_db(&db)?;
-            }
-
-            let folders: Vec<(String, String)> = folders
-                .iter()
-                .cloned()
-                .map(|(id, name)| {
-                    Ok((id, crate::actions::decrypt(&name, None, None)?))
-                })
-                .collect::<anyhow::Result<_>>()?;
-
-            for (id, name) in folders {
-                if name == folder_name {
-                    folder_id = Some(id);
-                }
-            }
-            if folder_id.is_none() {
-                let (tokens, id) = rbw::actions::create_folder(
-                    &access_token,
-                    &refresh_token,
-                    &crate::actions::encrypt(folder_name, None)?,
-                )?;
-                if let Some(tokens) = tokens {
-                    access_token = tokens.access_token;
-                    db.access_token = Some(access_token.clone());
-                    if let Some(new_refresh_token) = tokens.refresh_token {
-                        refresh_token = new_refresh_token;
-                        db.refresh_token = Some(refresh_token.clone());
-                    }
-                    save_db(&db)?;
-                }
-                folder_id = Some(id);
-            }
-        }
-
-        if let (Some(tokens), ()) = rbw::actions::add(
-            &access_token,
-            &refresh_token,
-            &name,
-            &rbw::db::EntryData::Login {
-                username,
+        crate::items::add(crate::items::NewItem {
+            name: name.to_string(),
+            username: username.map(std::string::ToString::to_string),
+            uris: uris.iter().map(|(uri, _)| uri.clone()).collect(),
+            folder: folder.map(std::string::ToString::to_string),
+            secure_note: false,
+            changes: crate::items::Changes {
                 password: Some(password),
-                uris,
-                totp: None,
+                ..crate::items::Changes::default()
             },
-            None,
-            folder_id.as_deref(),
-        )? {
-            db.access_token = Some(tokens.access_token);
-            if let Some(refresh_token) = tokens.refresh_token {
-                db.refresh_token = Some(refresh_token);
-            }
-            save_db(&db)?;
-        }
-
-        crate::actions::sync()?;
+            no_edit: true,
+            attach: vec![],
+        })?;
     }
-
-    Ok(())
-}
-
-pub fn edit(
-    name: Needle,
-    username: Option<&str>,
-    folder: Option<&str>,
-    ignore_case: bool,
-) -> anyhow::Result<()> {
-    unlock()?;
-
-    let mut db = load_db()?;
-    let access_token = db.access_token.as_ref().unwrap();
-    let refresh_token = db.refresh_token.as_ref().unwrap();
-
-    let desc = format!(
-        "{}{}",
-        username.map_or_else(String::new, |s| format!("{s}@")),
-        name
-    );
-
-    let (entry, decrypted) =
-        find_entry(&db, name, username, folder, ignore_case)
-            .with_context(|| format!("couldn't find entry for '{desc}'"))?;
-
-    let (data, fields, notes, history) = match &decrypted.data {
-        DecryptedData::Login { password, .. } => {
-            let mut contents =
-                format!("{}\n", password.as_deref().unwrap_or(""));
-            if let Some(notes) = decrypted.notes {
-                write!(contents, "\n{notes}\n").unwrap();
-            }
-
-            let contents = rbw::edit::edit(&contents, HELP_PW)?;
-
-            let (password, notes) = parse_editor(&contents);
-            let password = password
-                .map(|password| {
-                    crate::actions::encrypt(
-                        &password,
-                        entry.org_id.as_deref(),
-                    )
-                })
-                .transpose()?;
-            let notes = notes
-                .map(|notes| {
-                    crate::actions::encrypt(&notes, entry.org_id.as_deref())
-                })
-                .transpose()?;
-            let mut history = entry.history.clone();
-            let rbw::db::EntryData::Login {
-                username: entry_username,
-                password: entry_password,
-                uris: entry_uris,
-                totp: entry_totp,
-            } = &entry.data
-            else {
-                unreachable!();
-            };
-
-            if let Some(prev_password) = entry_password.clone() {
-                let new_history_entry = rbw::db::HistoryEntry {
-                    last_used_date: format!(
-                        "{}",
-                        humantime::format_rfc3339(
-                            std::time::SystemTime::now()
-                        )
-                    ),
-                    password: prev_password,
-                };
-                history.insert(0, new_history_entry);
-            }
-
-            let data = rbw::db::EntryData::Login {
-                username: entry_username.clone(),
-                password,
-                uris: entry_uris.clone(),
-                totp: entry_totp.clone(),
-            };
-            (data, entry.fields, notes, history)
-        }
-        DecryptedData::SecureNote => {
-            let data = rbw::db::EntryData::SecureNote {};
-
-            let editor_content = decrypted.notes.map_or_else(
-                || "\n".to_string(),
-                |notes| format!("{notes}\n"),
-            );
-            let contents = rbw::edit::edit(&editor_content, HELP_NOTES)?;
-
-            // prepend blank line to be parsed as pw by `parse_editor`
-            let (_, notes) = parse_editor(&format!("\n{contents}\n"));
-
-            let notes = notes
-                .map(|notes| {
-                    crate::actions::encrypt(&notes, entry.org_id.as_deref())
-                })
-                .transpose()?;
-
-            (data, entry.fields, notes, entry.history)
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "modifications are only supported for login and note entries"
-            ));
-        }
-    };
-
-    if let (Some(tokens), ()) = rbw::actions::edit(
-        access_token,
-        refresh_token,
-        &entry.id,
-        entry.org_id.as_deref(),
-        &entry.name,
-        &data,
-        &fields,
-        notes.as_deref(),
-        entry.folder_id.as_deref(),
-        &history,
-    )? {
-        db.access_token = Some(tokens.access_token);
-        if let Some(refresh_token) = tokens.refresh_token {
-            db.refresh_token = Some(refresh_token);
-        }
-        save_db(&db)?;
-    }
-
-    crate::actions::sync()?;
-    Ok(())
-}
-
-pub fn remove(
-    name: Needle,
-    username: Option<&str>,
-    folder: Option<&str>,
-    ignore_case: bool,
-) -> anyhow::Result<()> {
-    unlock()?;
-
-    let mut db = load_db()?;
-    let access_token = db.access_token.as_ref().unwrap();
-    let refresh_token = db.refresh_token.as_ref().unwrap();
-
-    let desc = format!(
-        "{}{}",
-        username.map_or_else(String::new, |s| format!("{s}@")),
-        name
-    );
-
-    let (entry, _) = find_entry(&db, name, username, folder, ignore_case)
-        .with_context(|| format!("couldn't find entry for '{desc}'"))?;
-
-    if let (Some(tokens), ()) =
-        rbw::actions::remove(access_token, refresh_token, &entry.id)?
-    {
-        db.access_token = Some(tokens.access_token);
-        if let Some(refresh_token) = tokens.refresh_token {
-            db.refresh_token = Some(refresh_token);
-        }
-        save_db(&db)?;
-    }
-
-    crate::actions::sync()?;
 
     Ok(())
 }
@@ -2065,7 +1731,7 @@ fn version_or_quit() -> anyhow::Result<u32> {
     })
 }
 
-fn find_entry(
+pub(crate) fn find_entry(
     db: &rbw::db::Db,
     mut needle: Needle,
     username: Option<&str>,
@@ -2216,10 +1882,7 @@ impl EntryDecryptor for ReplayingDecryptor {
 
 fn record_batch<T>(
     entries: &[rbw::db::Entry],
-    each: &impl Fn(
-        &rbw::db::Entry,
-        &dyn EntryDecryptor,
-    ) -> anyhow::Result<T>,
+    each: &impl Fn(&rbw::db::Entry, &dyn EntryDecryptor) -> anyhow::Result<T>,
 ) -> Vec<rbw::protocol::DecryptItem> {
     let recorder = RecordingDecryptor::default();
     for entry in entries {
@@ -2232,10 +1895,7 @@ fn record_batch<T>(
 
 fn replay_batch<T>(
     entries: &[rbw::db::Entry],
-    each: &impl Fn(
-        &rbw::db::Entry,
-        &dyn EntryDecryptor,
-    ) -> anyhow::Result<T>,
+    each: &impl Fn(&rbw::db::Entry, &dyn EntryDecryptor) -> anyhow::Result<T>,
     results: Vec<Result<String, String>>,
 ) -> anyhow::Result<Vec<T>> {
     let replayer =
@@ -2835,10 +2495,27 @@ fn decrypt_cipher(
         fields,
         notes,
         history,
+        attachments: entry
+            .attachments
+            .iter()
+            .map(|attachment| DecryptedAttachment {
+                id: attachment.id.clone(),
+                file_name: decrypt_field(
+                    Field::Name,
+                    attachment.file_name.as_deref(),
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                    decryptor,
+                ),
+                size: attachment.size.clone(),
+            })
+            .collect(),
     })
 }
 
-fn parse_editor(contents: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn parse_legacy_editor(
+    contents: &str,
+) -> (Option<String>, Option<String>) {
     let mut lines = contents.lines();
 
     let password = lines.next().map(std::string::ToString::to_string);
@@ -2859,23 +2536,12 @@ fn parse_editor(contents: &str) -> (Option<String>, Option<String>) {
     (password, notes)
 }
 
-fn load_db() -> anyhow::Result<rbw::db::Db> {
+pub(crate) fn load_db() -> anyhow::Result<rbw::db::Db> {
     let config = rbw::config::Config::load()?;
     config.email.as_ref().map_or_else(
         || Err(anyhow::anyhow!("failed to find email address in config")),
         |email| {
             rbw::db::Db::load(&config.server_name(), email)
-                .map_err(anyhow::Error::new)
-        },
-    )
-}
-
-fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
-    let config = rbw::config::Config::load()?;
-    config.email.as_ref().map_or_else(
-        || Err(anyhow::anyhow!("failed to find email address in config")),
-        |email| {
-            db.save(&config.server_name(), email)
                 .map_err(anyhow::Error::new)
         },
     )
@@ -3020,9 +2686,10 @@ impl InjectContext {
 
     fn resolve(&self, reference: &InjectReference) -> anyhow::Result<String> {
         let (entry, _) = self.find_entry_raw(&reference.target)?;
-        let decrypted = decrypt_cipher_batched(&entry).with_context(|| {
-            format!("failed to decrypt entry '{}'", reference.id)
-        })?;
+        let decrypted =
+            decrypt_cipher_batched(&entry).with_context(|| {
+                format!("failed to decrypt entry '{}'", reference.id)
+            })?;
         resolve_inject_value(&decrypted, reference.field.as_deref())
             .with_context(|| {
                 format!(
@@ -5221,6 +4888,7 @@ mod test {
             }],
             key: Some("entry key".to_string()),
             master_password_reprompt: rbw::api::CipherRepromptType::None,
+            attachments: vec![],
         };
         let entries = vec![entry.clone(), entry];
 
@@ -5274,6 +4942,7 @@ mod test {
                 history: vec![],
                 key: None,
                 master_password_reprompt: rbw::api::CipherRepromptType::None,
+                attachments: vec![],
             },
             DecryptedSearchCipher {
                 id: id.to_string(),
@@ -6045,6 +5714,7 @@ mod test {
                     .collect(),
                 notes: None,
                 history: vec![],
+                attachments: vec![],
             };
 
             assert_eq!(

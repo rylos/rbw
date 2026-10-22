@@ -187,6 +187,9 @@ pub enum Error {
     #[error("api request unauthorized")]
     RequestUnauthorized,
 
+    #[error("api request returned error {status}: {message}")]
+    RequestFailedWithMessage { status: u16, message: String },
+
     #[error("error making api request")]
     Reqwest { source: reqwest::Error },
 

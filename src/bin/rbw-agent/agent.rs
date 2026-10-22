@@ -179,15 +179,58 @@ async fn handle_request(
             .await?;
             true
         }
-        rbw::protocol::Action::Encrypt { plaintext, org_id } => {
+        rbw::protocol::Action::Encrypt {
+            plaintext,
+            org_id,
+            entry_key,
+        } => {
             crate::actions::encrypt(
                 sock,
                 state.clone(),
                 plaintext,
+                entry_key.as_deref(),
                 org_id.as_deref(),
             )
             .await?;
             true
+        }
+        rbw::protocol::Action::EncryptAttachment {
+            data,
+            entry_key,
+            org_id,
+        } => {
+            crate::actions::encrypt_attachment(
+                sock,
+                state.clone(),
+                data,
+                entry_key.as_deref(),
+                org_id.as_deref(),
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::DecryptAttachment {
+            data,
+            key,
+            entry_key,
+            org_id,
+        } => {
+            crate::actions::decrypt_attachment(
+                sock,
+                state.clone(),
+                &environment,
+                data,
+                key.as_deref(),
+                entry_key.as_deref(),
+                org_id.as_deref(),
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::RefreshToken => {
+            crate::actions::refresh_token(sock, state.clone(), &environment)
+                .await?;
+            false
         }
         rbw::protocol::Action::ClipboardStore { text } => {
             crate::actions::clipboard_store(sock, state.clone(), text)

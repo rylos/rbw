@@ -42,6 +42,8 @@ async fn tokio_main(
             master_password_reprompt: std::collections::HashSet::new(),
             master_password_reprompt_initialized: false,
             last_environment: rbw::protocol::Environment::from_process(),
+            api_key: None,
+            login_expired_notified: false,
             #[cfg(feature = "clipboard")]
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|e| {

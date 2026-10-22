@@ -9,6 +9,7 @@ use clap::{CommandFactory as _, Parser as _};
 
 mod actions;
 mod commands;
+mod items;
 mod sock;
 
 #[derive(Debug, clap::Args)]
@@ -21,6 +22,142 @@ struct FindArgs {
     folder: Option<String>,
     #[arg(short, long, help = "Ignore case")]
     ignorecase: bool,
+}
+
+// values that can be set on an entry from the command line
+#[derive(Debug, clap::Args)]
+struct ValueArgs {
+    #[arg(long, help = "Set the username")]
+    username: Option<String>,
+    #[arg(long, help = "Read the password from the first line of stdin")]
+    password_stdin: bool,
+    #[arg(long, help = "Set the TOTP secret or otpauth:// URI")]
+    totp: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME=VALUE",
+        help = "Set a text custom field",
+        value_parser = items::parse_field,
+        number_of_values = 1
+    )]
+    field: Vec<(String, String)>,
+    #[arg(
+        long,
+        value_name = "NAME=VALUE",
+        help = "Set a hidden custom field",
+        value_parser = items::parse_field,
+        number_of_values = 1
+    )]
+    hidden_field: Vec<(String, String)>,
+    #[arg(long, help = "Set the notes")]
+    notes: Option<String>,
+    #[arg(long, help = "Read the notes from a file (- for stdin)")]
+    notes_file: Option<std::path::PathBuf>,
+}
+
+impl ValueArgs {
+    fn changes(self) -> items::Changes {
+        let mut fields: Vec<_> = self
+            .field
+            .into_iter()
+            .map(|(name, value)| (items::FIELD_TYPE_TEXT, name, value))
+            .collect();
+        fields.extend(
+            self.hidden_field
+                .into_iter()
+                .map(|(name, value)| (items::FIELD_TYPE_HIDDEN, name, value)),
+        );
+        items::Changes {
+            username: self.username,
+            password_stdin: self.password_stdin,
+            totp: self.totp,
+            fields,
+            notes: self.notes,
+            notes_file: self.notes_file,
+            ..items::Changes::default()
+        }
+    }
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum FolderCommand {
+    #[command(about = "List folders", visible_alias = "ls")]
+    List {
+        #[arg(long, help = "Display output as JSON")]
+        raw: bool,
+    },
+    #[command(about = "Create a folder")]
+    Add { name: String },
+    #[command(about = "Rename a folder")]
+    Rename { name: String, new_name: String },
+    #[command(
+        about = "Delete a folder (its entries are kept, without a folder)",
+        visible_alias = "rm"
+    )]
+    Remove { name: String },
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum AttachmentCommand {
+    #[command(
+        about = "List the attachments of an entry",
+        visible_alias = "ls"
+    )]
+    List {
+        #[command(flatten)]
+        find_args: FindArgs,
+        #[arg(long, help = "Display output as JSON")]
+        raw: bool,
+    },
+    #[command(about = "Save an attachment to a file")]
+    Get {
+        #[command(flatten)]
+        find_args: FindArgs,
+        #[arg(
+            long,
+            help = "File name or id of the attachment (needed when there \
+                is more than one)"
+        )]
+        name: Option<String>,
+        #[arg(
+            short,
+            long,
+            help = "Where to save it (- for stdout); defaults to the \
+                attachment's name in the current directory"
+        )]
+        output: Option<std::path::PathBuf>,
+        #[arg(long, help = "Overwrite the output file if it exists")]
+        force: bool,
+    },
+    #[command(about = "Attach files to an entry")]
+    Add {
+        #[command(flatten)]
+        find_args: FindArgs,
+        #[arg(
+            long,
+            required = true,
+            help = "File to attach (- for stdin); repeat for more",
+            number_of_values = 1
+        )]
+        file: Vec<std::path::PathBuf>,
+        #[arg(
+            long,
+            help = "Name to store the attachment under (default: the \
+                file's name)"
+        )]
+        name: Option<String>,
+    },
+    #[command(about = "Delete an attachment", visible_alias = "rm")]
+    Remove {
+        #[command(flatten)]
+        find_args: FindArgs,
+        #[arg(
+            long,
+            help = "File name or id of the attachment (needed when there \
+                is more than one)"
+        )]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, clap::Parser)]
@@ -150,13 +287,15 @@ enum Opt {
     },
 
     #[command(
-        about = "Add a new password to the database",
-        long_about = "Add a new password to the database\n\n\
-            This command will open a text editor to enter \
-            the password and notes. The editor to use is determined \
-            by the value of the $VISUAL or $EDITOR environment variables.
-            The first line will be saved as the password and the \
-            remainder will be saved as a note."
+        about = "Add a new entry to the database",
+        long_about = "Add a new entry to the database\n\n\
+            Without any of the options that set values, this command opens \
+            a text editor with every field of the new entry. The editor to \
+            use is determined by the value of the $VISUAL or $EDITOR \
+            environment variables.\n\n\
+            When stdin is not a terminal and no values are given as \
+            options, the first line of stdin is saved as the password and \
+            the remainder as the notes."
     )]
     Add {
         #[arg(help = "Name of the password entry")]
@@ -171,6 +310,22 @@ enum Opt {
         uri: Vec<String>,
         #[arg(long, help = "Folder for the password entry")]
         folder: Option<String>,
+        #[arg(long, help = "Create a secure note instead of a login")]
+        secure_note: bool,
+        #[arg(
+            long,
+            help = "Don't open the editor, save the entry as given by the \
+                options"
+        )]
+        no_edit: bool,
+        #[arg(
+            long,
+            help = "Attach a file to the new entry",
+            number_of_values = 1
+        )]
+        attach: Vec<std::path::PathBuf>,
+        #[command(flatten)]
+        values: ValueArgs,
     },
 
     #[command(
@@ -229,24 +384,85 @@ enum Opt {
     },
 
     #[command(
-        about = "Modify an existing password",
-        long_about = "Modify an existing password\n\n\
-            This command will open a text editor with the existing \
-            password and notes of the given entry for editing. \
-            The editor to use is determined  by the value of the \
-            $VISUAL or $EDITOR environment variables. The first line \
-            will be saved as the password and the remainder will be saved \
-            as a note."
+        about = "Modify an existing entry",
+        long_about = "Modify an existing entry\n\n\
+            Without any of the options that change values, this command \
+            opens a text editor with every field of the entry. The editor \
+            to use is determined by the value of the $VISUAL or $EDITOR \
+            environment variables.\n\n\
+            Only the values that change are written back; everything else \
+            about the entry (passkeys, attachments, favorite, ...) is kept."
     )]
     Edit {
         #[command(flatten)]
         find_args: FindArgs,
+        #[arg(long, help = "New name for the entry")]
+        rename: Option<String>,
+        #[arg(long, help = "Move the entry to this folder (\"\" for none)")]
+        move_to: Option<String>,
+        #[arg(
+            long,
+            help = "Replace all URIs (repeat for more than one)",
+            number_of_values = 1
+        )]
+        set_uri: Vec<String>,
+        #[arg(long, help = "Add a URI", number_of_values = 1)]
+        add_uri: Vec<String>,
+        #[arg(
+            long,
+            help = "Remove the custom field with this name",
+            number_of_values = 1
+        )]
+        remove_field: Vec<String>,
+        #[arg(long, help = "Mark or unmark the entry as a favorite")]
+        favorite: Option<bool>,
+        #[command(flatten)]
+        values: ValueArgs,
     },
 
-    #[command(about = "Remove a given entry", visible_alias = "rm")]
+    #[command(
+        about = "Remove a given entry",
+        long_about = "Remove a given entry\n\n\
+            The entry is moved to the trash, from where `rbw restore` brings \
+            it back.",
+        visible_alias = "rm"
+    )]
     Remove {
         #[command(flatten)]
         find_args: FindArgs,
+        #[arg(
+            long,
+            help = "Delete the entry for good instead of moving it \
+            to the trash"
+        )]
+        permanent: bool,
+    },
+
+    #[command(about = "List the entries in the trash")]
+    Trash {
+        #[arg(long, help = "Display output as JSON")]
+        raw: bool,
+    },
+
+    #[command(about = "Restore an entry from the trash")]
+    Restore {
+        #[arg(help = "Name or UUID of the entry in the trash")]
+        needle: String,
+    },
+
+    #[command(about = "Manage folders")]
+    Folder {
+        #[command(subcommand)]
+        folder: FolderCommand,
+    },
+
+    #[command(
+        about = "Manage the attachments of an entry",
+        visible_alias = "att"
+    )]
+    Attachment {
+        #[command(subcommand)]
+        attachment: AttachmentCommand,
     },
 
     #[command(about = "View the password history for a given entry")]
@@ -292,6 +508,10 @@ impl Opt {
             Self::Generate { .. } => "generate".to_string(),
             Self::Edit { .. } => "edit".to_string(),
             Self::Remove { .. } => "remove".to_string(),
+            Self::Trash { .. } => "trash".to_string(),
+            Self::Restore { .. } => "restore".to_string(),
+            Self::Folder { .. } => "folder".to_string(),
+            Self::Attachment { .. } => "attachment".to_string(),
             Self::History { .. } => "history".to_string(),
             Self::Lock => "lock".to_string(),
             Self::Purge => "purge".to_string(),
@@ -432,16 +652,20 @@ fn main() {
             user,
             uri,
             folder,
-        } => commands::add(
-            &name,
-            user.as_deref(),
-            &uri.iter()
-                // XXX not sure what the ui for specifying the match type
-                // should be
-                .map(|uri| (uri.clone(), None))
-                .collect::<Vec<_>>(),
-            folder.as_deref(),
-        ),
+            secure_note,
+            no_edit,
+            attach,
+            values,
+        } => items::add(items::NewItem {
+            name,
+            username: user,
+            uris: uri,
+            folder,
+            secure_note,
+            changes: values.changes(),
+            no_edit,
+            attach,
+        }),
         Opt::Generate {
             len,
             name,
@@ -477,18 +701,101 @@ fn main() {
                 ty,
             )
         }
-        Opt::Edit { find_args } => commands::edit(
+        Opt::Edit {
+            find_args,
+            rename,
+            move_to,
+            set_uri,
+            add_uri,
+            remove_field,
+            favorite,
+            values,
+        } => {
+            let mut changes = values.changes();
+            changes.name = rename;
+            changes.folder = move_to;
+            changes.uris = if set_uri.is_empty() {
+                None
+            } else {
+                Some(set_uri)
+            };
+            changes.add_uris = add_uri;
+            changes.remove_fields = remove_field;
+            changes.favorite = favorite;
+            items::edit(
+                find_args.needle,
+                find_args.user.as_deref(),
+                find_args.folder.as_deref(),
+                find_args.ignorecase,
+                &changes,
+            )
+        }
+        Opt::Remove {
+            find_args,
+            permanent,
+        } => items::remove(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
             find_args.ignorecase,
+            permanent,
         ),
-        Opt::Remove { find_args } => commands::remove(
-            find_args.needle,
-            find_args.user.as_deref(),
-            find_args.folder.as_deref(),
-            find_args.ignorecase,
-        ),
+        Opt::Trash { raw } => items::trash(raw),
+        Opt::Restore { needle } => items::restore(&needle),
+        Opt::Folder { folder } => match folder {
+            FolderCommand::List { raw } => items::folder_list(raw),
+            FolderCommand::Add { name } => items::folder_add(&name),
+            FolderCommand::Rename { name, new_name } => {
+                items::folder_rename(&name, &new_name)
+            }
+            FolderCommand::Remove { name } => items::folder_remove(&name),
+        },
+        Opt::Attachment { attachment } => match attachment {
+            AttachmentCommand::List { find_args, raw } => {
+                items::attachment_list(
+                    find_args.needle,
+                    find_args.user.as_deref(),
+                    find_args.folder.as_deref(),
+                    find_args.ignorecase,
+                    raw,
+                )
+            }
+            AttachmentCommand::Get {
+                find_args,
+                name,
+                output,
+                force,
+            } => items::attachment_get(
+                find_args.needle,
+                find_args.user.as_deref(),
+                find_args.folder.as_deref(),
+                find_args.ignorecase,
+                name.as_deref(),
+                output.as_deref(),
+                force,
+            ),
+            AttachmentCommand::Add {
+                find_args,
+                file,
+                name,
+            } => items::attachment_add(
+                find_args.needle,
+                find_args.user.as_deref(),
+                find_args.folder.as_deref(),
+                find_args.ignorecase,
+                &file,
+                name.as_deref(),
+            ),
+            AttachmentCommand::Remove { find_args, name } => {
+                items::attachment_remove(
+                    find_args.needle,
+                    find_args.user.as_deref(),
+                    find_args.folder.as_deref(),
+                    find_args.ignorecase,
+                    name.as_deref(),
+                )
+            }
+        },
         Opt::History { find_args } => commands::history(
             find_args.needle,
             find_args.user.as_deref(),

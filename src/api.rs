@@ -434,6 +434,20 @@ struct SyncResCipher {
     key: Option<String>,
     #[serde(rename = "Reprompt", alias = "reprompt")]
     reprompt: CipherRepromptType,
+    #[serde(rename = "Attachments", alias = "attachments", default)]
+    attachments: Option<Vec<SyncResAttachment>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SyncResAttachment {
+    #[serde(rename = "Id", alias = "id")]
+    id: String,
+    #[serde(rename = "FileName", alias = "fileName")]
+    file_name: Option<String>,
+    #[serde(rename = "Size", alias = "size")]
+    size: Option<serde_json::Value>,
+    #[serde(rename = "Key", alias = "key")]
+    key: Option<String>,
 }
 
 impl SyncResCipher {
@@ -532,7 +546,10 @@ impl SyncResCipher {
                 fingerprint: ssh_key.fingerprint.clone(),
             }
         } else {
-            return None;
+            // item types this version doesn't know about (bank accounts,
+            // passports, ...) are still shown, with their name, notes and
+            // custom fields
+            crate::db::EntryData::SecureNote
         };
         let fields = self.fields.as_ref().map_or_else(Vec::new, |fields| {
             fields
@@ -557,6 +574,25 @@ impl SyncResCipher {
             history,
             key: self.key.clone(),
             master_password_reprompt: self.reprompt,
+            attachments: self.attachments.as_ref().map_or_else(
+                Vec::new,
+                |attachments| {
+                    attachments
+                        .iter()
+                        .map(|attachment| crate::db::Attachment {
+                            id: attachment.id.clone(),
+                            file_name: attachment.file_name.clone(),
+                            size: attachment.size.as_ref().map(|size| {
+                                size.as_str().map_or_else(
+                                    || size.to_string(),
+                                    std::string::ToString::to_string,
+                                )
+                            }),
+                            key: attachment.key.clone(),
+                        })
+                        .collect()
+                },
+            ),
         })
     }
 }
@@ -813,6 +849,105 @@ struct FoldersResData {
 #[derive(serde::Serialize, Debug)]
 struct FoldersPostReq {
     name: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentPostReq {
+    key: String,
+    file_name: String,
+    file_size: usize,
+    admin_request: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct AttachmentPostRes {
+    #[serde(rename = "AttachmentId", alias = "attachmentId")]
+    attachment_id: String,
+    #[serde(rename = "FileUploadType", alias = "fileUploadType")]
+    file_upload_type: u32,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct AttachmentGetRes {
+    #[serde(rename = "Url", alias = "url")]
+    url: String,
+    #[serde(rename = "Key", alias = "key")]
+    key: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct ApiKeyLogin {
+    pub access_token: String,
+    #[serde(rename = "Key", alias = "key")]
+    pub key: String,
+    #[serde(rename = "Kdf", alias = "kdf")]
+    pub kdf: KdfType,
+    #[serde(rename = "KdfIterations", alias = "kdfIterations")]
+    pub iterations: u32,
+    #[serde(rename = "KdfMemory", alias = "kdfMemory")]
+    pub memory: Option<u32>,
+    #[serde(rename = "KdfParallelism", alias = "kdfParallelism")]
+    pub parallelism: Option<u32>,
+}
+
+// Returns the id of the user an access token was issued to. Vaultwarden
+// requires it as `encryptedFor` on every cipher that is created or updated.
+pub fn access_token_user_id(access_token: &str) -> Result<String> {
+    let invalid = || Error::RequestFailedWithMessage {
+        status: 0,
+        message: "failed to read the user id from the access token"
+            .to_string(),
+    };
+    let payload = access_token.split('.').nth(1).ok_or_else(invalid)?;
+    let payload = crate::base64::decode_url_safe_no_pad(payload)
+        .map_err(|_| invalid())?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|_| invalid())?;
+    claims
+        .get("sub")
+        .and_then(serde_json::Value::as_str)
+        .map(std::string::ToString::to_string)
+        .ok_or_else(invalid)
+}
+
+fn check_response(
+    res: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(res);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::RequestUnauthorized);
+    }
+    let code = status.as_u16();
+    let message = res.text().ok().and_then(|body| api_error_message(&body));
+    Err(
+        message.map_or(Error::RequestFailed { status: code }, |message| {
+            Error::RequestFailedWithMessage {
+                status: code,
+                message,
+            }
+        }),
+    )
+}
+
+// pulls the human readable part out of an error response, so that errors
+// like "the client copy of this cipher is out of date" reach the user
+fn api_error_message(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let get = |value: &serde_json::Value, keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| value.get(*key))
+            .and_then(serde_json::Value::as_str)
+            .map(std::string::ToString::to_string)
+    };
+    get(&json, &["message", "Message", "error_description"]).or_else(|| {
+        json.get("errorModel")
+            .or_else(|| json.get("ErrorModel"))
+            .and_then(|model| get(model, &["message", "Message"]))
+    })
 }
 
 // Used for the Bitwarden-Client-Name header. Accepted values:
@@ -1596,6 +1731,311 @@ impl Client {
         let connect_res: ConnectRefreshTokenRes =
             res.json_with_path().await?;
         Ok((connect_res.access_token, connect_res.refresh_token))
+    }
+
+    pub fn get_cipher(
+        &self,
+        access_token: &str,
+        id: &str,
+    ) -> Result<serde_json::Value> {
+        let res = reqwest::blocking::Client::new()
+            .get(self.api_url(&format!("/ciphers/{id}")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?.json_with_path()
+    }
+
+    pub fn create_cipher(
+        &self,
+        access_token: &str,
+        cipher: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let res = reqwest::blocking::Client::new()
+            .post(self.api_url("/ciphers"))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(cipher)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?.json_with_path()
+    }
+
+    pub fn update_cipher(
+        &self,
+        access_token: &str,
+        id: &str,
+        cipher: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let res = reqwest::blocking::Client::new()
+            .put(self.api_url(&format!("/ciphers/{id}")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(cipher)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?.json_with_path()
+    }
+
+    // moves the cipher to the trash, from where it can be restored
+    pub fn trash_cipher(&self, access_token: &str, id: &str) -> Result<()> {
+        let res = reqwest::blocking::Client::new()
+            .put(self.api_url(&format!("/ciphers/{id}/delete")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?;
+        Ok(())
+    }
+
+    pub fn restore_cipher(&self, access_token: &str, id: &str) -> Result<()> {
+        let res = reqwest::blocking::Client::new()
+            .put(self.api_url(&format!("/ciphers/{id}/restore")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?;
+        Ok(())
+    }
+
+    // the local db only keeps live entries, so the trash is read from a
+    // fresh sync
+    pub fn trashed_ciphers(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let res = reqwest::blocking::Client::new()
+            .get(self.api_url("/sync?excludeDomains=true"))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        let sync: serde_json::Value =
+            check_response(res)?.json_with_path()?;
+        let ciphers = sync
+            .get("ciphers")
+            .or_else(|| sync.get("Ciphers"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(ciphers
+            .into_iter()
+            .filter(|cipher| {
+                cipher
+                    .get("deletedDate")
+                    .or_else(|| cipher.get("DeletedDate"))
+                    .is_some_and(|date| !date.is_null())
+            })
+            .collect())
+    }
+
+    pub fn rename_folder(
+        &self,
+        access_token: &str,
+        id: &str,
+        name: &str,
+    ) -> Result<()> {
+        let req = FoldersPostReq {
+            name: name.to_string(),
+        };
+        let res = reqwest::blocking::Client::new()
+            .put(self.api_url(&format!("/folders/{id}")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(&req)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?;
+        Ok(())
+    }
+
+    pub fn delete_folder(&self, access_token: &str, id: &str) -> Result<()> {
+        let res = reqwest::blocking::Client::new()
+            .delete(self.api_url(&format!("/folders/{id}")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?;
+        Ok(())
+    }
+
+    // registers a new attachment on the server and uploads its (already
+    // encrypted) contents
+    pub fn add_attachment(
+        &self,
+        access_token: &str,
+        cipher_id: &str,
+        key: &str,
+        file_name: &str,
+        data: Vec<u8>,
+    ) -> Result<String> {
+        let req = AttachmentPostReq {
+            key: key.to_string(),
+            file_name: file_name.to_string(),
+            file_size: data.len(),
+            admin_request: false,
+        };
+        let client = reqwest::blocking::Client::new();
+        let res = client
+            .post(
+                self.api_url(&format!("/ciphers/{cipher_id}/attachment/v2")),
+            )
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(&req)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        let upload: AttachmentPostRes =
+            check_response(res)?.json_with_path()?;
+        if upload.file_upload_type != 0 {
+            return Err(Error::RequestFailedWithMessage {
+                status: 0,
+                message: format!(
+                    "unsupported attachment upload type {} (only direct \
+                     uploads are implemented)",
+                    upload.file_upload_type
+                ),
+            });
+        }
+
+        let part = reqwest::blocking::multipart::Part::bytes(data)
+            .file_name(file_name.to_string())
+            .mime_str("application/octet-stream")
+            .map_err(|source| Error::Reqwest { source })?;
+        let form =
+            reqwest::blocking::multipart::Form::new().part("data", part);
+        let res = client
+            .post(self.api_url(&format!(
+                "/ciphers/{cipher_id}/attachment/{}",
+                upload.attachment_id
+            )))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .multipart(form)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        if let Err(e) = check_response(res) {
+            // don't leave an attachment without contents behind
+            let _ = self.delete_attachment(
+                access_token,
+                cipher_id,
+                &upload.attachment_id,
+            );
+            return Err(e);
+        }
+        Ok(upload.attachment_id)
+    }
+
+    // returns the attachment's (encrypted) key and its encrypted contents
+    pub fn download_attachment(
+        &self,
+        access_token: &str,
+        cipher_id: &str,
+        attachment_id: &str,
+    ) -> Result<(Option<String>, Vec<u8>)> {
+        let client = reqwest::blocking::Client::new();
+        let res = client
+            .get(self.api_url(&format!(
+                "/ciphers/{cipher_id}/attachment/{attachment_id}"
+            )))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        let info: AttachmentGetRes = check_response(res)?.json_with_path()?;
+        // the url is absolute when the server knows its own domain, and
+        // otherwise relative to the server root
+        let url = if info.url.starts_with("http://")
+            || info.url.starts_with("https://")
+        {
+            info.url
+        } else {
+            let base = self.base_url.trim_end_matches('/');
+            let base = base.strip_suffix("/api").unwrap_or(base);
+            format!("{base}{}", info.url)
+        };
+        let res = client
+            .get(url)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        let data = check_response(res)?
+            .bytes()
+            .map_err(|source| Error::Reqwest { source })?
+            .to_vec();
+        Ok((info.key, data))
+    }
+
+    pub fn delete_attachment(
+        &self,
+        access_token: &str,
+        cipher_id: &str,
+        attachment_id: &str,
+    ) -> Result<()> {
+        let res = reqwest::blocking::Client::new()
+            .delete(self.api_url(&format!(
+                "/ciphers/{cipher_id}/attachment/{attachment_id}"
+            )))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?;
+        Ok(())
+    }
+
+    // logs in with the personal api key. this skips two factor
+    // authentication, but the server doesn't hand out a refresh token, so
+    // the same login has to be repeated whenever the access token expires.
+    pub async fn login_api_key(
+        &self,
+        email: &str,
+        device_id: &str,
+        apikey: &crate::locked::ApiKey,
+    ) -> Result<ApiKeyLogin> {
+        let connect_req =
+            ConnectTokenReq {
+                auth: ConnectTokenAuth::ClientCredentials(
+                    ConnectTokenClientCredentials {
+                        username: email.to_string(),
+                        client_secret: String::from_utf8(
+                            apikey.client_secret().to_vec(),
+                        )
+                        .map_err(|_| Error::IncorrectPassword {
+                            message: "client_secret is not valid utf8"
+                                .to_string(),
+                        })?,
+                    },
+                ),
+                grant_type: "client_credentials".to_string(),
+                scope: "api".to_string(),
+                client_id: String::from_utf8(apikey.client_id().to_vec())
+                    .map_err(|_| Error::IncorrectPassword {
+                        message: "client_id is not valid utf8".to_string(),
+                    })?,
+                device_type: u32::from(DEVICE_TYPE),
+                device_identifier: device_id.to_string(),
+                device_name: "rbw".to_string(),
+                device_push_token: String::new(),
+                two_factor_token: None,
+                two_factor_provider: None,
+            };
+        let client = self.reqwest_client().await?;
+        let res = client
+            .post(self.identity_url("/connect/token"))
+            .form(&connect_req)
+            .send()
+            .await
+            .map_err(|source| Error::Reqwest { source })?;
+        if res.status() == reqwest::StatusCode::OK {
+            res.json_with_path().await
+        } else {
+            let code = res.status().as_u16();
+            match res.text().await {
+                Ok(body) => match body.clone().json_with_path() {
+                    Ok(json) => Err(classify_login_error(&json, code)),
+                    Err(e) => {
+                        log::warn!("{e}: {body}");
+                        Err(Error::RequestFailed { status: code })
+                    }
+                },
+                Err(e) => {
+                    log::warn!("failed to read response body: {e}");
+                    Err(Error::RequestFailed { status: code })
+                }
+            }
+        }
     }
 
     fn api_url(&self, path: &str) -> String {

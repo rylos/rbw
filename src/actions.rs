@@ -61,6 +61,20 @@ pub async fn login(
     ))
 }
 
+pub async fn login_api_key(
+    email: &str,
+    apikey: &crate::locked::ApiKey,
+) -> Result<crate::api::ApiKeyLogin> {
+    let (client, config) = api_client_async().await?;
+    client
+        .login_api_key(
+            email,
+            &crate::config::device_id(&config).await?,
+            apikey,
+        )
+        .await
+}
+
 pub async fn send_two_factor_email(
     email: &str,
     sso_email_2fa_session_token: &str,
@@ -152,7 +166,7 @@ pub async fn sync(
     .await
 }
 
-async fn sync_once(
+pub async fn sync_once(
     access_token: &str,
 ) -> Result<(
     String,
@@ -351,7 +365,7 @@ fn exchange_refresh_token(refresh_token: &str) -> Result<RefreshedTokens> {
     })
 }
 
-async fn exchange_refresh_token_async(
+pub async fn exchange_refresh_token_async(
     refresh_token: &str,
 ) -> Result<RefreshedTokens> {
     let (client, _) = api_client()?;
@@ -363,7 +377,7 @@ async fn exchange_refresh_token_async(
     })
 }
 
-fn api_client() -> Result<(crate::api::Client, crate::config::Config)> {
+pub fn api_client() -> Result<(crate::api::Client, crate::config::Config)> {
     let config = crate::config::Config::load()?;
     let client = crate::api::Client::new(
         &config.base_url(),

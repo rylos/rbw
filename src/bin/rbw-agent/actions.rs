@@ -1,5 +1,4 @@
 use anyhow::Context as _;
-use sha2::Digest as _;
 
 pub async fn register(
     sock: &mut crate::sock::Sock,
@@ -80,6 +79,27 @@ pub async fn login(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
+    let db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
+
+    if db.needs_login() && config_persistent_login().await? {
+        // the api key skips two factor authentication; the master password
+        // is still needed to unlock the keys
+        match api_key_login(state.clone(), Some(environment)).await {
+            Ok(_) => {
+                sync(None, state.clone()).await?;
+                unlock_state(state, environment).await?;
+                respond_ack(sock).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!(
+                    "api key login failed, falling back to password login: \
+                     {e:#}"
+                );
+            }
+        }
+    }
+
     let db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
 
     if db.needs_login() {
@@ -331,6 +351,7 @@ async fn login_success(
 ) -> anyhow::Result<()> {
     db.access_token = Some(access_token.clone());
     db.refresh_token = Some(refresh_token.clone());
+    db.api_key_login = false;
     db.kdf = Some(kdf);
     db.iterations = Some(iterations);
     db.memory = memory;
@@ -509,56 +530,37 @@ pub async fn sync(
     sock: Option<&mut crate::sock::Sock>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
-    let mut db = load_db().await?;
+    let db = load_db().await?;
 
     let access_token = if let Some(access_token) = &db.access_token {
         access_token.clone()
+    } else if db.protected_key.is_some() && config_persistent_login().await? {
+        // logged in before, but the tokens were dropped
+        fresh_access_token(state.clone(), None).await?
     } else {
         return Err(anyhow::anyhow!("failed to find access token in db"));
     };
-    let refresh_token = if let Some(refresh_token) = &db.refresh_token {
-        refresh_token.clone()
-    } else {
-        return Err(anyhow::anyhow!("failed to find refresh token in db"));
-    };
-    let (
-        tokens,
-        (protected_key, protected_private_key, protected_org_keys, entries),
-    ) = match rbw::actions::sync(&access_token, &refresh_token).await {
-        Ok(res) => res,
-        // The server will never accept this refresh token again, so retrying
-        // on the sync interval only repeats the same rejection forever. Drop
-        // the tokens instead: that makes db.needs_login() true, so the next
-        // command the user runs goes through the ordinary login flow, and the
-        // syncs in between fail locally without touching the network.
-        Err(rbw::error::Error::RefreshTokenInvalid) => {
-            // Re-read rather than trusting the copy loaded above: a concurrent
-            // sync may have rotated the token while this request was in
-            // flight, in which case the server is rejecting a token that has
-            // already been superseded and the stored replacement is valid.
-            // Only clear if what we sent is still what is stored.
-            let mut current = load_db().await?;
-            if current.refresh_token.as_deref()
-                == Some(refresh_token.as_str())
-            {
-                current.access_token = None;
-                current.refresh_token = None;
-                save_db(&current).await?;
+    let (protected_key, protected_private_key, protected_org_keys, entries) =
+        match rbw::actions::sync_once(&access_token).await {
+            Ok(res) => res,
+            Err(rbw::error::Error::RequestUnauthorized) => {
+                let access_token =
+                    fresh_access_token(state.clone(), None).await?;
+                rbw::actions::sync_once(&access_token)
+                    .await
+                    .context("failed to sync database from server")?
             }
-            return Err(rbw::error::Error::RefreshTokenInvalid)
-                .context("failed to sync database from server");
-        }
-        Err(e) => {
-            return Err(e).context("failed to sync database from server")
-        }
-    };
-    state.lock().await.set_master_password_reprompt(&entries);
-    if let Some(tokens) = tokens {
-        db.access_token = Some(tokens.access_token);
-        if let Some(refresh_token) = tokens.refresh_token {
-            db.refresh_token = Some(refresh_token);
-        }
+            Err(e) => {
+                return Err(e).context("failed to sync database from server")
+            }
+        };
+    {
+        let mut state = state.lock().await;
+        state.set_master_password_reprompt(&entries);
+        state.login_expired_notified = false;
     }
+    // the tokens may have been replaced while syncing
+    let mut db = load_db().await?;
     db.protected_key = Some(protected_key);
     db.protected_private_key = Some(protected_private_key);
     db.protected_org_keys = protected_org_keys;
@@ -606,86 +608,8 @@ async fn decrypt_cipher(
         None
     };
 
-    let mut sha256 = sha2::Sha256::new();
-    sha256.update(cipherstring);
-    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
-    if state
-        .master_password_reprompt
-        .contains(&master_password_reprompt)
-    {
-        let db = load_db().await?;
-
-        let Some(kdf) = db.kdf else {
-            return Err(anyhow::anyhow!("failed to find kdf type in db"));
-        };
-
-        let Some(iterations) = db.iterations else {
-            return Err(anyhow::anyhow!(
-                "failed to find number of iterations in db"
-            ));
-        };
-
-        let memory = db.memory;
-        let parallelism = db.parallelism;
-
-        let Some(protected_key) = db.protected_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected key in db"
-            ));
-        };
-        let Some(protected_private_key) = db.protected_private_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected private key in db"
-            ));
-        };
-
-        let email = config_email().await?;
-
-        let mut err_msg = None;
-        for i in 1_u8..=3 {
-            let err = if i > 1 {
-                // this unwrap is safe because we only ever continue the loop
-                // if we have set err_msg
-                Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-            } else {
-                None
-            };
-            let password = rbw::pinentry::getpin(
-                &config_pinentry().await?,
-                "Master Password",
-                "Accessing this entry requires the master password",
-                err.as_deref(),
-                environment,
-                true,
-            )
-            .await
-            .context("failed to read password from pinentry")?;
-            match rbw::actions::unlock(
-                &email,
-                &password,
-                kdf,
-                iterations,
-                memory,
-                parallelism,
-                &protected_key,
-                &protected_private_key,
-                &db.protected_org_keys,
-            ) {
-                Ok(_) => {
-                    break;
-                }
-                Err(rbw::error::Error::IncorrectPassword { message }) => {
-                    if i == 3 {
-                        return Err(rbw::error::Error::IncorrectPassword {
-                            message,
-                        })
-                        .context("failed to unlock database");
-                    }
-                    err_msg = Some(message);
-                }
-                Err(e) => return Err(e).context("failed to unlock database"),
-            }
-        }
+    if state.needs_master_password_reprompt(cipherstring) {
+        master_password_reprompt(environment).await?;
     }
 
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
@@ -698,6 +622,86 @@ async fn decrypt_cipher(
     .context("failed to parse decrypted secret")?;
 
     Ok(plaintext)
+}
+
+// asks for the master password again before giving out a value of an entry
+// that has master password reprompt enabled
+async fn master_password_reprompt(
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    let db = load_db().await?;
+
+    let Some(kdf) = db.kdf else {
+        return Err(anyhow::anyhow!("failed to find kdf type in db"));
+    };
+
+    let Some(iterations) = db.iterations else {
+        return Err(anyhow::anyhow!(
+            "failed to find number of iterations in db"
+        ));
+    };
+
+    let memory = db.memory;
+    let parallelism = db.parallelism;
+
+    let Some(protected_key) = db.protected_key else {
+        return Err(anyhow::anyhow!("failed to find protected key in db"));
+    };
+    let Some(protected_private_key) = db.protected_private_key else {
+        return Err(anyhow::anyhow!(
+            "failed to find protected private key in db"
+        ));
+    };
+
+    let email = config_email().await?;
+
+    let mut err_msg = None;
+    for i in 1_u8..=3 {
+        let err = if i > 1 {
+            // this unwrap is safe because we only ever continue the loop
+            // if we have set err_msg
+            Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
+        } else {
+            None
+        };
+        let password = rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "Master Password",
+            "Accessing this entry requires the master password",
+            err.as_deref(),
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read password from pinentry")?;
+        match rbw::actions::unlock(
+            &email,
+            &password,
+            kdf,
+            iterations,
+            memory,
+            parallelism,
+            &protected_key,
+            &protected_private_key,
+            &db.protected_org_keys,
+        ) {
+            Ok(_) => {
+                break;
+            }
+            Err(rbw::error::Error::IncorrectPassword { message }) => {
+                if i == 3 {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed to unlock database");
+                }
+                err_msg = Some(message);
+            }
+            Err(e) => return Err(e).context("failed to unlock database"),
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn decrypt(
@@ -746,16 +750,13 @@ pub async fn encrypt(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     plaintext: &str,
+    entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let state = state.lock().await;
-    let Some(keys) = state.key(org_id) else {
-        return Err(anyhow::anyhow!(
-            "failed to find encryption keys in in-memory state"
-        ));
-    };
+    let keys = entry_keys(&state, entry_key, org_id)?;
     let cipherstring = rbw::cipherstring::CipherString::encrypt_symmetric(
-        keys,
+        &keys,
         plaintext.as_bytes(),
     )
     .context("failed to encrypt plaintext secret")?;
@@ -763,6 +764,288 @@ pub async fn encrypt(
     respond_encrypt(sock, cipherstring.to_string()).await?;
 
     Ok(())
+}
+
+// the keys that an entry's values are encrypted with: its own key if it has
+// one, otherwise the key of its organization or of the user
+fn entry_keys(
+    state: &crate::state::State,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<rbw::locked::Keys> {
+    let Some(keys) = state.key(org_id) else {
+        return Err(anyhow::anyhow!(
+            "failed to find encryption keys in in-memory state"
+        ));
+    };
+    if let Some(entry_key) = entry_key {
+        let key_cipherstring =
+            rbw::cipherstring::CipherString::new(entry_key)
+                .context("failed to parse individual item encryption key")?;
+        Ok(rbw::locked::Keys::new(
+            key_cipherstring.decrypt_locked_symmetric(keys).context(
+                "failed to decrypt individual item encryption key",
+            )?,
+        ))
+    } else {
+        Ok(keys.clone())
+    }
+}
+
+pub async fn encrypt_attachment(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    data: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let data = rbw::base64::decode(data).context("invalid base64")?;
+    let state = state.lock().await;
+    let keys = entry_keys(&state, entry_key, org_id)?;
+
+    let attachment_key = rbw::cipherstring::random_key();
+    let mut raw_key = rbw::locked::Vec::new();
+    raw_key.extend(attachment_key.enc_key().iter().copied());
+    raw_key.extend(attachment_key.mac_key().iter().copied());
+    let key = rbw::cipherstring::CipherString::encrypt_symmetric(
+        &keys,
+        raw_key.data(),
+    )
+    .context("failed to encrypt attachment key")?;
+    let encrypted = rbw::cipherstring::encrypt_bytes(&attachment_key, &data)
+        .context("failed to encrypt attachment")?;
+
+    sock.send(&rbw::protocol::Response::EncryptAttachment {
+        key: key.to_string(),
+        data: rbw::base64::encode(encrypted),
+    })
+    .await?;
+
+    Ok(())
+}
+
+pub async fn decrypt_attachment(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    data: &str,
+    key: Option<&str>,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let data = rbw::base64::decode(data).context("invalid base64")?;
+    let mut state = state.lock().await;
+    if !state.master_password_reprompt_initialized() {
+        let db = load_db().await?;
+        state.set_master_password_reprompt(&db.entries);
+    }
+    let keys = entry_keys(&state, entry_key, org_id)?;
+    let attachment_key = if let Some(key) = key {
+        if state.needs_master_password_reprompt(key) {
+            master_password_reprompt(environment).await?;
+        }
+        rbw::locked::Keys::new(
+            rbw::cipherstring::CipherString::new(key)
+                .context("failed to parse attachment key")?
+                .decrypt_locked_symmetric(&keys)
+                .context("failed to decrypt attachment key")?,
+        )
+    } else {
+        keys
+    };
+    let plaintext = rbw::cipherstring::decrypt_bytes(&attachment_key, &data)
+        .context("failed to decrypt attachment")?;
+
+    sock.send(&rbw::protocol::Response::DecryptAttachment {
+        data: rbw::base64::encode(plaintext),
+    })
+    .await?;
+
+    Ok(())
+}
+
+pub async fn refresh_token(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    fresh_access_token(state, Some(environment)).await?;
+
+    respond_ack(sock).await?;
+
+    Ok(())
+}
+
+// Gets a new access token and stores it in the db. The refresh token is
+// tried first; with persistent_login, an api key login takes over when there
+// is no refresh token or the server rejects it.
+async fn fresh_access_token(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: Option<&rbw::protocol::Environment>,
+) -> anyhow::Result<String> {
+    let persistent_login = config_persistent_login().await?;
+    let mut db = load_db().await?;
+
+    if let Some(refresh_token) = db.refresh_token.clone() {
+        match rbw::actions::exchange_refresh_token_async(&refresh_token).await
+        {
+            Ok(tokens) => {
+                db.access_token = Some(tokens.access_token.clone());
+                if let Some(refresh_token) = tokens.refresh_token {
+                    db.refresh_token = Some(refresh_token);
+                }
+                save_db(&db).await?;
+                return Ok(tokens.access_token);
+            }
+            // The server will never accept this refresh token again, so
+            // retrying on the sync interval only repeats the same rejection
+            // forever. Drop the tokens instead: that makes db.needs_login()
+            // true, so the next command the user runs goes through the
+            // ordinary login flow, and the syncs in between fail locally
+            // without touching the network.
+            Err(rbw::error::Error::RefreshTokenInvalid) => {
+                // Re-read rather than trusting the copy loaded above: a
+                // concurrent sync may have rotated the token while this
+                // request was in flight, in which case the server is
+                // rejecting a token that has already been superseded and
+                // the stored replacement is valid. Only clear if what we
+                // sent is still what is stored.
+                let mut current = load_db().await?;
+                if current.refresh_token.as_deref()
+                    == Some(refresh_token.as_str())
+                {
+                    current.access_token = None;
+                    current.refresh_token = None;
+                    current.api_key_login = false;
+                    save_db(&current).await?;
+                } else if let Some(access_token) = current.access_token {
+                    return Ok(access_token);
+                }
+                if !persistent_login {
+                    login_expired(&state).await;
+                    return Err(rbw::error::Error::RefreshTokenInvalid)
+                        .context("failed to refresh access token");
+                }
+            }
+            Err(e) => {
+                return Err(e).context("failed to refresh access token")
+            }
+        }
+    } else if !persistent_login {
+        login_expired(&state).await;
+        return Err(anyhow::anyhow!("failed to find refresh token in db"));
+    }
+
+    match api_key_login(state.clone(), environment).await {
+        Ok(access_token) => Ok(access_token),
+        Err(e) => {
+            login_expired(&state).await;
+            Err(e)
+        }
+    }
+}
+
+// Logs in with the personal api key and stores the new access token. The
+// key is asked for through the pinentry (so a wrapper can answer from a
+// keyring) and kept in memory for the next time the token expires.
+async fn api_key_login(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: Option<&rbw::protocol::Environment>,
+) -> anyhow::Result<String> {
+    let email = config_email().await?;
+    let cached = state.lock().await.api_key.clone();
+    let apikey = if let Some(apikey) = cached {
+        apikey
+    } else {
+        let environment = match environment {
+            Some(environment) => environment.clone(),
+            None => state.lock().await.last_environment().clone(),
+        };
+        let host = config_host().await?;
+        let client_id = rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "API key client__id",
+            &format!("Log in to {host}"),
+            None,
+            &environment,
+            false,
+        )
+        .await
+        .context("failed to read client_id from pinentry")?;
+        let client_secret = rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "API key client__secret",
+            &format!("Log in to {host}"),
+            None,
+            &environment,
+            false,
+        )
+        .await
+        .context("failed to read client_secret from pinentry")?;
+        rbw::locked::ApiKey::new(client_id, client_secret)
+    };
+
+    let login = match rbw::actions::login_api_key(&email, &apikey).await {
+        Ok(login) => login,
+        Err(e) => {
+            state.lock().await.api_key = None;
+            return Err(e).context("failed to log in with the api key");
+        }
+    };
+
+    let mut db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
+    db.access_token = Some(login.access_token.clone());
+    db.refresh_token = None;
+    db.api_key_login = true;
+    db.kdf = Some(login.kdf);
+    db.iterations = Some(login.iterations);
+    db.memory = login.memory;
+    db.parallelism = login.parallelism;
+    db.protected_key = Some(login.key);
+    save_db(&db).await?;
+
+    state.lock().await.api_key = Some(apikey);
+
+    Ok(login.access_token)
+}
+
+// tells the user (once, until the next successful sync) that the agent can
+// no longer reach the vault on its own
+async fn login_expired(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) {
+    let mut state = state.lock().await;
+    if state.login_expired_notified {
+        return;
+    }
+    state.login_expired_notified = true;
+    if !config_notify().await.unwrap_or(false) {
+        return;
+    }
+    let env = state.last_environment().env_vars();
+    drop(state);
+    let profile = rbw::dirs::profile();
+    let body = if profile == "rbw" {
+        "The local copy of the vault is no longer synced. Run `rbw login`."
+            .to_string()
+    } else {
+        format!(
+            "The local copy of the vault is no longer synced. Run \
+             `RBW_PROFILE={profile} rbw login`."
+        )
+    };
+    let res = tokio::process::Command::new("notify-send")
+        .args(["--app-name=rbw", "--urgency=critical", "rbw: login expired"])
+        .arg(body)
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    if let Err(e) = res {
+        log::warn!("failed to run notify-send: {e}");
+    }
 }
 
 #[cfg(feature = "clipboard")]
@@ -865,6 +1148,27 @@ async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
 async fn config_base_url() -> anyhow::Result<String> {
     let config = rbw::config::Config::load_async().await?;
     Ok(config.base_url())
+}
+
+async fn config_persistent_login() -> anyhow::Result<bool> {
+    let config = rbw::config::Config::load_async().await?;
+    Ok(config.persistent_login)
+}
+
+async fn config_notify() -> anyhow::Result<bool> {
+    let config = rbw::config::Config::load_async().await?;
+    Ok(config.notify)
+}
+
+async fn config_host() -> anyhow::Result<String> {
+    let url_str = config_base_url().await?;
+    let url =
+        reqwest::Url::parse(&url_str).context("failed to parse base url")?;
+    url.host_str()
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!("couldn't find host in rbw base url {url_str}")
+        })
 }
 
 async fn config_pinentry() -> anyhow::Result<String> {

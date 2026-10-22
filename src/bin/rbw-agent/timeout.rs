@@ -1,5 +1,5 @@
-use std::time::SystemTime;
 use futures_util::StreamExt as _;
+use std::time::SystemTime;
 use tokio::time;
 
 #[derive(Debug, Hash, Eq, PartialEq, Copy, Clone)]

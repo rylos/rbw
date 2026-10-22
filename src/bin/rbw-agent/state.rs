@@ -24,6 +24,11 @@ pub struct State {
     // should all send their own environment over.
     pub last_environment: rbw::protocol::Environment,
 
+    // the personal api key, kept after the first api key login so that the
+    // next one (when the access token expires) doesn't need the pinentry
+    pub api_key: Option<rbw::locked::ApiKey>,
+    pub login_expired_notified: bool,
+
     #[cfg(feature = "clipboard")]
     pub clipboard: Option<arboard::Clipboard>,
 }
@@ -124,9 +129,20 @@ impl State {
                     insert(field.value.as_deref());
                 }
             }
+
+            for attachment in &entry.attachments {
+                insert(attachment.key.as_deref());
+            }
         }
 
         self.master_password_reprompt_initialized = true;
+    }
+
+    pub fn needs_master_password_reprompt(&self, cipherstring: &str) -> bool {
+        let mut sha256 = sha2::Sha256::new();
+        sha256.update(cipherstring);
+        let hash: [u8; 32] = sha256.finalize().into();
+        self.master_password_reprompt.contains(&hash)
     }
 
     pub fn master_password_reprompt_initialized(&self) -> bool {

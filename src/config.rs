@@ -19,6 +19,15 @@ pub struct Config {
     #[serde(default = "default_pinentry")]
     pub pinentry: String,
     pub client_cert_path: Option<std::path::PathBuf>,
+    // when the refresh token stops working, log in again with the personal
+    // api key (asked for through the pinentry) instead of requiring a new
+    // interactive login with two factor authentication
+    #[serde(default)]
+    pub persistent_login: bool,
+    // show a desktop notification when the agent can no longer reach the
+    // vault because the login expired
+    #[serde(default = "default_notify")]
+    pub notify: bool,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
     pub device_id: Option<String>,
@@ -37,6 +46,8 @@ impl Default for Config {
             sync_interval: default_sync_interval(),
             pinentry: default_pinentry(),
             client_cert_path: None,
+            persistent_login: false,
+            notify: default_notify(),
             device_id: None,
         }
     }
@@ -48,6 +59,10 @@ pub fn default_lock_timeout() -> u64 {
 
 pub fn default_sync_interval() -> u64 {
     3600
+}
+
+pub fn default_notify() -> bool {
+    true
 }
 
 pub fn default_pinentry() -> String {
