@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased] - enhanced fork
+
+## Added
+
+* `rbw add` and `rbw edit` set every field from the command line
+  (`--username`, `--password-stdin`, `--totp`, `--field`, `--hidden-field`,
+  `--notes`, `--notes-file`, `--rename`, `--move-to`, `--set-uri`,
+  `--add-uri`, `--remove-field`, `--favorite`) or from an editor showing every
+  field; `rbw add --secure-note`, `rbw add --attach`.
+* `rbw trash`, `rbw restore`, `rbw rm --permanent`.
+* `rbw folder list|add|rename|rm`.
+* `rbw attachment list|get|add|rm`; `rbw get --raw` lists attachments.
+* `persistent_login` config option: log in again with the personal API key
+  when the refresh token is rejected.
+* Desktop notification when the login expired (`notify` config option).
+
+## Changed
+
+* `rbw rm` moves the entry to the trash.
+* `rbw edit` only re-encrypts the values that changed and keeps the rest of
+  the entry as the server stores it (passkeys, favorite, archive state, item
+  keys, attachments, unknown types). It also refuses an empty stdin.
+* Token refreshes from the client go through the agent.
+* Item types rbw doesn't know are shown as notes.
+
+## Fixed
+
+* `rbw add` and `rbw edit` failed with 422 on Vaultwarden 1.34+ (missing
+  `encryptedFor`).
+* Editing an entry with its own encryption key corrupted it.
+* Editing an entry dropped its passkeys, favorite flag and reprompt setting.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added
