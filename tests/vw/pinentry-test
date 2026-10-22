@@ -8,8 +8,8 @@ while IFS= read -r line; do
     SETPROMPT*|SETDESC*) desc="$desc $line"; echo OK ;;
     GETPIN*)
       case "$desc" in
-        *client_id*|*"client id"*|*"Client ID"*) echo "D ${RBW_TEST_APIKEY_ID}" ;;
-        *client_secret*|*"client secret"*|*"Client Secret"*) echo "D ${RBW_TEST_APIKEY_SECRET}" ;;
+        *client_id*|*client__id*) echo "D ${RBW_TEST_APIKEY_ID}" ;;
+        *client_secret*|*client__secret*) echo "D ${RBW_TEST_APIKEY_SECRET}" ;;
         *) echo "D ${RBW_TEST_PIN:-test-password-123}" ;;
       esac
       desc=""; echo OK ;;

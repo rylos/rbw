@@ -988,7 +988,15 @@ async fn api_key_login(
     let login = match rbw::actions::login_api_key(&email, &apikey).await {
         Ok(login) => login,
         Err(e) => {
-            state.lock().await.api_key = None;
+            // keep the key through network errors and rate limits, forget
+            // it when the server rejects it
+            if matches!(
+                e,
+                rbw::error::Error::IncorrectPassword { .. }
+                    | rbw::error::Error::RequestFailed { status: 400 | 401 }
+            ) {
+                state.lock().await.api_key = None;
+            }
             return Err(e).context("failed to log in with the api key");
         }
     };
@@ -1025,15 +1033,19 @@ async fn login_expired(
     let env = state.last_environment().env_vars();
     drop(state);
     let profile = rbw::dirs::profile();
-    let body = if profile == "rbw" {
-        "The local copy of the vault is no longer synced. Run `rbw login`."
-            .to_string()
-    } else {
-        format!(
+    let body = profile.strip_prefix("rbw-").map_or_else(
+        || {
             "The local copy of the vault is no longer synced. Run \
-             `RBW_PROFILE={profile} rbw login`."
-        )
-    };
+             `rbw login`."
+                .to_string()
+        },
+        |profile| {
+            format!(
+                "The local copy of the vault is no longer synced. Run \
+                 `RBW_PROFILE={profile} rbw login`."
+            )
+        },
+    );
     let res = tokio::process::Command::new("notify-send")
         .args(["--app-name=rbw", "--urgency=critical", "rbw: login expired"])
         .arg(body)

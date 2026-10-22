@@ -7,6 +7,7 @@
 // and the server's revision check rejects the write if the item changed in
 // the meantime.
 
+use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 
 use anyhow::Context as _;
@@ -499,7 +500,7 @@ pub struct NewItem {
     pub attach: Vec<std::path::PathBuf>,
 }
 
-pub fn add(item: NewItem) -> anyhow::Result<()> {
+pub fn add(item: &NewItem) -> anyhow::Result<()> {
     crate::commands::unlock()?;
 
     let mut form = Form {
@@ -611,6 +612,14 @@ pub fn edit(
         edit_form(&old, old.login.is_none())?
     } else {
         let (password, notes) = read_legacy_stdin(old.login.is_some())?;
+        if password.is_none() && notes.is_none() {
+            // most likely run from a script or another program by mistake;
+            // an empty stdin would otherwise wipe the password and notes
+            return Err(anyhow::anyhow!(
+                "stdin is not a terminal and is empty, the entry was not \
+                 changed (use the options to change single values)"
+            ));
+        }
         let mut new = old.clone();
         if let Some(login) = &mut new.login {
             login.password = password;
@@ -720,9 +729,8 @@ pub fn restore(needle: &str) -> anyhow::Result<()> {
 
 // (id, name, deleted date) of every item in the trash
 fn trashed() -> anyhow::Result<Vec<(String, String, String)>> {
-    let ciphers =
-        api_call(|client, access_token| client.trashed_ciphers(access_token))
-            .context("failed to read the trash from the server")?;
+    let ciphers = api_call(rbw::api::Client::trashed_ciphers)
+        .context("failed to read the trash from the server")?;
     let mut items = vec![];
     for json in ciphers {
         let item = Item::from_json(json);
@@ -1012,6 +1020,7 @@ fn choose_attachment<'a>(
     attachments: &'a [crate::commands::DecryptedAttachment],
     wanted: Option<&str>,
 ) -> anyhow::Result<&'a crate::commands::DecryptedAttachment> {
+    #[allow(clippy::option_if_let_else)]
     if let Some(wanted) = wanted {
         let matches: Vec<_> = attachments
             .iter()
@@ -1057,9 +1066,8 @@ fn find(
 
 // (id, decrypted name) of every folder
 fn folders() -> anyhow::Result<Vec<(String, String)>> {
-    let folders =
-        api_call(|client, access_token| client.folders(access_token))
-            .context("failed to list folders")?;
+    let folders = api_call(rbw::api::Client::folders)
+        .context("failed to list folders")?;
     folders
         .into_iter()
         .map(|(id, name)| {
@@ -1127,40 +1135,38 @@ const EDIT_HELP: &str = "\
 ";
 
 fn render_form(form: &Form) -> String {
+    // writing to a String can't fail
     let mut out = String::new();
     out.push_str(EDIT_HELP);
-    out.push_str(&format!("name: {}\n", form.name));
+    let _ = writeln!(out, "name: {}", form.name);
     if let Some(login) = &form.login {
-        out.push_str(&format!(
-            "username: {}\n",
+        let _ = writeln!(
+            out,
+            "username: {}",
             login.username.as_deref().unwrap_or("")
-        ));
-        out.push_str(&format!(
-            "password: {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "password: {}",
             login.password.as_deref().unwrap_or("")
-        ));
-        out.push_str(&format!(
-            "totp: {}\n",
-            login.totp.as_deref().unwrap_or("")
-        ));
+        );
+        let _ =
+            writeln!(out, "totp: {}", login.totp.as_deref().unwrap_or(""));
         if login.uris.is_empty() {
             out.push_str("uri: \n");
         }
         for uri in &login.uris {
-            out.push_str(&format!("uri: {uri}\n"));
+            let _ = writeln!(out, "uri: {uri}");
         }
     }
-    out.push_str(&format!(
-        "folder: {}\n",
-        form.folder.as_deref().unwrap_or("")
-    ));
+    let _ = writeln!(out, "folder: {}", form.folder.as_deref().unwrap_or(""));
     for field in &form.fields {
         let ty = match field.ty {
             FIELD_HIDDEN => "hidden",
             FIELD_BOOLEAN => "boolean",
             _ => "text",
         };
-        out.push_str(&format!("{ty}: {} = {}\n", field.name, field.value));
+        let _ = writeln!(out, "{ty}: {} = {}", field.name, field.value);
     }
     out.push_str(NOTES_SEPARATOR);
     out.push('\n');

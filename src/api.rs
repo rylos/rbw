@@ -451,6 +451,7 @@ struct SyncResAttachment {
 }
 
 impl SyncResCipher {
+    #[allow(clippy::option_if_let_else)]
     fn to_entry(
         &self,
         folders: &[SyncResFolder],

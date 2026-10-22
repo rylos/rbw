@@ -341,7 +341,7 @@ impl From<DecryptedSearchCipher> for DecryptedListCipher {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
-pub(crate) struct DecryptedCipher {
+pub struct DecryptedCipher {
     id: String,
     folder: Option<String>,
     name: String,
@@ -350,15 +350,15 @@ pub(crate) struct DecryptedCipher {
     notes: Option<String>,
     history: Vec<DecryptedHistoryEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) attachments: Vec<DecryptedAttachment>,
+    pub attachments: Vec<DecryptedAttachment>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
-pub(crate) struct DecryptedAttachment {
-    pub(crate) id: String,
-    pub(crate) file_name: Option<String>,
-    pub(crate) size: Option<String>,
+pub struct DecryptedAttachment {
+    pub id: String,
+    pub file_name: Option<String>,
+    pub size: Option<String>,
 }
 
 impl DecryptedCipher {
@@ -1583,7 +1583,7 @@ pub fn generate(
     println!("{password}");
 
     if let Some(name) = name {
-        crate::items::add(crate::items::NewItem {
+        crate::items::add(&crate::items::NewItem {
             name: name.to_string(),
             username: username.map(std::string::ToString::to_string),
             uris: uris.iter().map(|(uri, _)| uri.clone()).collect(),
@@ -1731,7 +1731,7 @@ fn version_or_quit() -> anyhow::Result<u32> {
     })
 }
 
-pub(crate) fn find_entry(
+pub fn find_entry(
     db: &rbw::db::Db,
     mut needle: Needle,
     username: Option<&str>,
@@ -2513,7 +2513,7 @@ fn decrypt_cipher(
     })
 }
 
-pub(crate) fn parse_legacy_editor(
+pub fn parse_legacy_editor(
     contents: &str,
 ) -> (Option<String>, Option<String>) {
     let mut lines = contents.lines();
@@ -2536,7 +2536,7 @@ pub(crate) fn parse_legacy_editor(
     (password, notes)
 }
 
-pub(crate) fn load_db() -> anyhow::Result<rbw::db::Db> {
+pub fn load_db() -> anyhow::Result<rbw::db::Db> {
     let config = rbw::config::Config::load()?;
     config.email.as_ref().map_or_else(
         || Err(anyhow::anyhow!("failed to find email address in config")),

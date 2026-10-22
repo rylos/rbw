@@ -656,7 +656,7 @@ fn main() {
             no_edit,
             attach,
             values,
-        } => items::add(items::NewItem {
+        } => items::add(&items::NewItem {
             name,
             username: user,
             uris: uri,
