@@ -1681,8 +1681,18 @@ fn ensure_agent() -> anyhow::Result<()> {
         return Ok(());
     }
     run_agent()?;
-    check_agent_version()?;
-    Ok(())
+    // when another command started the agent a moment ago, run_agent
+    // returns at once (the pid file is taken) but the agent may not listen
+    // on its socket yet
+    let mut res = check_agent_version();
+    for _ in 0..100 {
+        if !matches!(&res, Err(e) if agent_not_listening(e)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        res = check_agent_version();
+    }
+    res
 }
 
 fn run_agent() -> anyhow::Result<()> {
@@ -1725,9 +1735,27 @@ fn check_agent_version() -> anyhow::Result<()> {
     Ok(())
 }
 
+// stops an agent that answers but can't be talked to. When nothing listens
+// there is nothing to stop, and the quit could reach an agent that another
+// command is starting right now: it would lose its keys and ask for the
+// master password again.
 fn version_or_quit() -> anyhow::Result<u32> {
-    crate::actions::version().inspect_err(|_| {
-        let _ = crate::actions::quit();
+    crate::actions::version().inspect_err(|e| {
+        if !agent_not_listening(e) {
+            let _ = crate::actions::quit();
+        }
+    })
+}
+
+fn agent_not_listening(e: &anyhow::Error) -> bool {
+    e.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+            )
+        })
     })
 }
 
@@ -3511,6 +3539,23 @@ fn display_field(name: &str, field: Option<&str>, clipboard: bool) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_agent_not_listening() {
+        let connect = |kind: std::io::ErrorKind| {
+            Err::<(), _>(std::io::Error::from(kind))
+                .context("failed to connect to rbw-agent")
+                .unwrap_err()
+        };
+        assert!(agent_not_listening(&connect(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(agent_not_listening(&connect(std::io::ErrorKind::NotFound)));
+        assert!(!agent_not_listening(&connect(
+            std::io::ErrorKind::ConnectionReset
+        )));
+        assert!(!agent_not_listening(&anyhow::anyhow!("unexpected message")));
+    }
 
     #[test]
     fn test_find_entry() {

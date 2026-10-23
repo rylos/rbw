@@ -32,6 +32,20 @@
 * Editing an entry with its own encryption key corrupted it.
 * Editing an entry dropped its passkeys, its reprompt setting and its
   archive state.
+* `rbw edit` with a non-tty, empty stdin wiped the password and notes; it
+  now refuses.
+* The agent's cache is replaced atomically: a command reading it while the
+  agent saved failed with `EOF while parsing`, and the agent took the half
+  written file for a logout and asked for the master password and 2FA again.
+* Commands started together on a stopped agent no longer fail with
+  `Connection refused` or stop the agent another command just started, and
+  on a locked agent they share a single master password prompt.
+
+## Removed
+
+* The typed cipher create/update requests in the library (`Client::add`,
+  `Client::edit` and their wrappers in `rbw::actions`), replaced by the raw
+  cipher json the commands send now.
 
 ## [1.15.0] - 2025-12-31
 

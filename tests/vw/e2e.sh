@@ -47,7 +47,10 @@ chmod +x "$WORK/bin/notify-send"
 
 (cd "$ROOT" && cargo build -q)
 docker rm -f vw-test >/dev/null 2>&1 || true
-docker run -d --name vw-test -p 127.0.0.1:8222:80 \
+# host networking: no port mapping, so no iptables DNAT rule, which docker
+# can't add after a kernel update until the next reboot
+docker run -d --name vw-test --network host \
+    -e ROCKET_ADDRESS=127.0.0.1 -e ROCKET_PORT=8222 \
     -e SIGNUPS_ALLOWED=true -e I_REALLY_WANT_VOLATILE_STORAGE=true \
     -e LOGIN_RATELIMIT_MAX_BURST=1000 -e LOGIN_RATELIMIT_SECONDS=1 \
     "vaultwarden/server:$TAG" >/dev/null
@@ -171,6 +174,32 @@ check "no login prompt while the vault was in use" 0 "$(wc -l <"$WORK/pinentry.l
 check "every concurrent edit landed" 40 "$(item flags '.login.uris | length')"
 check "no temporary files left next to the cache" 1 "$(find "$HOME/.cache/rbw-rbwtest" -maxdepth 1 -type f | wc -l)"
 cat "$WORK/readers.err" "$WORK/writers.err" 2>/dev/null | sort | uniq -c | head -5
+
+echo "== parallel commands on a stopped agent"
+# each command used to find the agent locked and open its own pinentry, and a
+# command that couldn't reach the agent yet stopped the one another command
+# had just started
+for round in 1 2 3; do
+    rbw stop-agent
+    : >"$WORK/pinentry.log"
+    rm -f "$WORK/parallel.fail"
+    for i in $(seq 1 8); do
+        (rbw get flags >/dev/null 2>>"$WORK/parallel.err" || echo "get $i" >>"$WORK/parallel.fail") &
+    done
+    wait
+    check "round $round: no command failed" 0 "$(cat "$WORK/parallel.fail" 2>/dev/null | wc -l)"
+    check "round $round: one master password prompt" 1 "$(wc -l <"$WORK/pinentry.log")"
+done
+rbw lock
+: >"$WORK/pinentry.log"
+rm -f "$WORK/parallel.fail"
+for i in $(seq 1 8); do
+    (rbw get flags >/dev/null 2>>"$WORK/parallel.err" || echo "get $i" >>"$WORK/parallel.fail") &
+done
+wait
+check "locked agent: no command failed" 0 "$(cat "$WORK/parallel.fail" 2>/dev/null | wc -l)"
+check "locked agent: one master password prompt" 1 "$(wc -l <"$WORK/pinentry.log")"
+sort "$WORK/parallel.err" 2>/dev/null | uniq -c | head -5
 rbw config set pinentry "$ROOT/tests/vw/pinentry-test"
 
 echo "== expired login"

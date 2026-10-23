@@ -1,9 +1,19 @@
 use anyhow::Context as _;
 
+// Requests are handled concurrently, so two commands started together (a
+// script and rofi-rbw, say) would each find the agent locked, or the access
+// token expired, and each open its own pinentry. These serialize everything
+// that asks for credentials; whoever comes second checks again and usually
+// finds the work done. Always taken in this order: LOGIN, TOKEN, UNLOCK.
+static LOGIN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static TOKEN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static UNLOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn register(
     sock: &mut crate::sock::Sock,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
+    let _login = LOGIN.lock().await;
     let db = load_db_or_new().await?;
 
     if db.needs_login() {
@@ -79,12 +89,17 @@ pub async fn login(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
+    let _login = LOGIN.lock().await;
     let db = load_db_or_new().await?;
 
     if db.needs_login() && config_persistent_login().await? {
         // the api key skips two factor authentication; the master password
         // is still needed to unlock the keys
-        match api_key_login(state.clone(), Some(environment)).await {
+        let res = {
+            let _token = TOKEN.lock().await;
+            api_key_login(state.clone(), Some(environment)).await
+        };
+        match res {
             Ok(_) => {
                 sync(None, state.clone()).await?;
                 unlock_state(state, environment).await?;
@@ -396,6 +411,7 @@ async fn unlock_state(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
+    let _unlock = UNLOCK.lock().await;
     if state.lock().await.needs_unlock() {
         let db = load_db().await?;
 
@@ -536,7 +552,7 @@ pub async fn sync(
         access_token.clone()
     } else if db.protected_key.is_some() && config_persistent_login().await? {
         // logged in before, but the tokens were dropped
-        fresh_access_token(state.clone(), None).await?
+        fresh_access_token(state.clone(), None, None).await?
     } else {
         return Err(anyhow::anyhow!("failed to find access token in db"));
     };
@@ -544,8 +560,12 @@ pub async fn sync(
         match rbw::actions::sync_once(&access_token).await {
             Ok(res) => res,
             Err(rbw::error::Error::RequestUnauthorized) => {
-                let access_token =
-                    fresh_access_token(state.clone(), None).await?;
+                let access_token = fresh_access_token(
+                    state.clone(),
+                    None,
+                    Some(&access_token),
+                )
+                .await?;
                 rbw::actions::sync_once(&access_token)
                     .await
                     .context("failed to sync database from server")?
@@ -869,7 +889,7 @@ pub async fn refresh_token(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    fresh_access_token(state, Some(environment)).await?;
+    fresh_access_token(state, Some(environment), None).await?;
 
     respond_ack(sock).await?;
 
@@ -878,13 +898,22 @@ pub async fn refresh_token(
 
 // Gets a new access token and stores it in the db. The refresh token is
 // tried first; with persistent_login, an api key login takes over when there
-// is no refresh token or the server rejects it.
+// is no refresh token or the server rejects it. `rejected` is the token the
+// caller saw refused: if the db holds another one by now, a concurrent
+// request already got it.
 async fn fresh_access_token(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: Option<&rbw::protocol::Environment>,
+    rejected: Option<&str>,
 ) -> anyhow::Result<String> {
+    let _token = TOKEN.lock().await;
     let persistent_login = config_persistent_login().await?;
     let mut db = load_db().await?;
+    if let (Some(rejected), Some(current)) = (rejected, &db.access_token) {
+        if current != rejected {
+            return Ok(current.clone());
+        }
+    }
 
     if let Some(refresh_token) = db.refresh_token.clone() {
         match rbw::actions::exchange_refresh_token_async(&refresh_token).await

@@ -75,6 +75,11 @@ an independent decryptor.
   half-written file for "not logged in" and asked for the master password
   and the 2FA code again. The cache is now replaced atomically, and only a
   missing file means logged out.
+* Commands started together on a stopped or locked agent (a script and
+  rofi-rbw, say) each opened their own pinentry, and all but the first
+  usually failed with `Connection refused` or stopped the agent the first had
+  just started. Now they wait for one agent and one prompt: unlocking,
+  logging in and getting a new token happen one at a time.
 
 ### Merged upstream pull requests
 
