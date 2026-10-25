@@ -1,10 +1,15 @@
 # rbw-enhanced
 
 An unofficial [Bitwarden](https://bitwarden.com/) client for Linux: a fast
-terminal UI, full read and write access to the vault, and unlocking with
-your face, fingerprint, a PIN or the TPM. Based on
-[rbw](https://github.com/doy/rbw) by Jesse Luehrs.
+terminal UI, full read and write access to the vault, and unlocking like the
+official apps. Based on [rbw](https://github.com/doy/rbw) by Jesse Luehrs.
 
+* **Face unlock with [howdy](https://github.com/boltgolt/howdy)**, which
+  doesn't work with the official desktop client on current polkit, plus
+  fingerprint, PIN or password.
+* **Opens by itself at login** if you want: the master password can be kept
+  sealed by `systemd-creds` (with the TPM when there is one) or in the
+  Secret Service, and the face is asked only to open the TUI.
 * **Drop-in replacement for rbw.** Same commands, options and config, and the
   read output (`rbw list --raw`, `rbw get --raw`, ...) is unchanged, so
   scripts and tools like [rofi-rbw](https://github.com/fdw/rofi-rbw) keep
