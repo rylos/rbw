@@ -6,7 +6,7 @@
 // module there works, and the user's polkit agent shows the dialog. Once the
 // action is authorized the agent either reuses the keys it kept in memory
 // when it was locked, or, for the first unlock after it started, reads the
-// master password saved with `rbw biometric enroll`.
+// master password saved with `rbw remember-password`.
 //
 // The saved password is encrypted with systemd-creds, scoped to the user and
 // tied to this machine (TPM2 plus the host key when there is a TPM, the host
@@ -68,7 +68,7 @@ fn credential_name() -> String {
 }
 
 // not the "master" item pinentry wrappers commonly read, so that
-// `rbw biometric disable` never deletes something it didn't create
+// `rbw forget-password` never deletes something it didn't create
 fn secret_service_account() -> String {
     format!("{}-biometric", crate::dirs::profile())
 }

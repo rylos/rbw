@@ -1256,14 +1256,8 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
                 Some(std::path::PathBuf::from(value.to_string()));
         }
         "lock_timeout" => {
-            let timeout = value
-                .parse()
-                .context("failed to parse value for lock_timeout")?;
-            if timeout == 0 {
-                log::error!("lock_timeout must be greater than 0");
-            } else {
-                config.lock_timeout = timeout;
-            }
+            config.lock_timeout = rbw::config::parse_lock_timeout(value)
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
         "sync_interval" => {
             let interval = value
@@ -1280,9 +1274,29 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.notify = parse_bool(value)
                 .context("failed to parse value for notify")?;
         }
-        "biometric" => {
-            config.biometric = parse_bool(value)
-                .context("failed to parse value for biometric")?;
+        "system_auth" => {
+            let on = parse_bool(value)
+                .context("failed to parse value for system_auth")?;
+            if on && !block_on(rbw::biometric::polkit_available()) {
+                return Err(anyhow::anyhow!(
+                    "the polkit action {} is not installed: see \
+                     contrib/polkit/README.md",
+                    rbw::biometric::POLKIT_ACTION
+                ));
+            }
+            config.system_auth = on;
+        }
+        "lock_on_sleep" => {
+            config.lock_on_sleep = parse_bool(value)
+                .context("failed to parse value for lock_on_sleep")?;
+        }
+        "lock_on_idle" => {
+            config.lock_on_idle = parse_bool(value)
+                .context("failed to parse value for lock_on_idle")?;
+        }
+        "timeout_action" => {
+            config.timeout_action =
+                value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         }
         "sort_by_usage" => {
             config.sort_by_usage = parse_bool(value)
@@ -1291,15 +1305,7 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
-
-    // drop in-memory keys, since they will be different if the email or url
-    // changed. not using lock() because we don't want to require the agent to
-    // be running (since this may be the user running `rbw config set
-    // base_url` as the first operation), and stop_agent() already handles the
-    // agent not running case gracefully.
-    stop_agent()?;
-
-    Ok(())
+    apply_config(key)
 }
 
 pub fn config_unset(key: &str) -> anyhow::Result<()> {
@@ -1319,20 +1325,45 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
         "persistent_login" => config.persistent_login = false,
         "notify" => config.notify = rbw::config::default_notify(),
-        "biometric" => config.biometric = false,
+        "system_auth" => config.system_auth = false,
+        "lock_on_sleep" => config.lock_on_sleep = false,
+        "lock_on_idle" => config.lock_on_idle = false,
+        "timeout_action" => {
+            config.timeout_action = rbw::config::TimeoutAction::default();
+        }
         "sort_by_usage" => config.sort_by_usage = false,
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
+    apply_config(key)
+}
+
+// settings the running agent can pick up; anything else (email, urls...)
+// restarts it
+const LIVE_KEYS: &[&str] = &[
+    "lock_timeout",
+    "lock_on_sleep",
+    "lock_on_idle",
+    "timeout_action",
+    "system_auth",
+    "sort_by_usage",
+    "notify",
+];
+
+fn apply_config(key: &str) -> anyhow::Result<()> {
+    if LIVE_KEYS.contains(&key) {
+        if crate::actions::status()?.is_some() {
+            crate::actions::reload_config()?;
+        }
+        return Ok(());
+    }
 
     // drop in-memory keys, since they will be different if the email or url
     // changed. not using lock() because we don't want to require the agent to
     // be running (since this may be the user running `rbw config set
     // base_url` as the first operation), and stop_agent() already handles the
     // agent not running case gracefully.
-    stop_agent()?;
-
-    Ok(())
+    stop_agent()
 }
 
 fn parse_bool(value: &str) -> anyhow::Result<bool> {
@@ -1662,7 +1693,8 @@ struct StatusOutput {
     logged_in: bool,
     locked: bool,
     keys_in_memory: bool,
-    biometric: bool,
+    system_auth: bool,
+    pin: bool,
     login_expired: bool,
     // unix time of the last successful sync
     last_sync: Option<u64>,
@@ -1685,16 +1717,20 @@ pub fn status(json: bool) -> anyhow::Result<()> {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
     let agent = crate::actions::status()?;
-    let biometric = agent.as_ref().map_or_else(
-        || config.as_ref().is_some_and(|config| config.biometric),
-        |agent| agent.biometric,
+    let system_auth = agent.as_ref().map_or_else(
+        || config.as_ref().is_some_and(|config| config.system_auth),
+        |agent| agent.system_auth,
     );
+    let pin = agent
+        .as_ref()
+        .map_or_else(rbw::pin::is_set, |agent| agent.pin);
     let out = StatusOutput {
         agent: agent.is_some(),
         logged_in: last_sync.is_some(),
         locked: agent.as_ref().is_none_or(|agent| agent.locked),
         keys_in_memory: agent.as_ref().is_some_and(|a| a.keys_in_memory),
-        biometric,
+        system_auth,
+        pin,
         login_expired: agent.as_ref().is_some_and(|a| a.login_expired),
         last_sync,
     };
@@ -1711,7 +1747,7 @@ pub fn status(json: bool) -> anyhow::Result<()> {
         } else if !out.locked {
             "unlocked"
         } else if out.keys_in_memory {
-            "locked (biometric unlock ready)"
+            "locked (pin or system unlock ready)"
         } else {
             "locked"
         };
@@ -1721,68 +1757,102 @@ pub fn status(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn biometric_enroll(store: Option<&str>) -> anyhow::Result<()> {
+pub fn remember_password(store: Option<&str>) -> anyhow::Result<()> {
     let store = store
         .map(str::parse::<rbw::biometric::SecretStore>)
         .transpose()?;
-    if !block_on(rbw::biometric::polkit_available()) {
-        return Err(anyhow::anyhow!(
-            "the polkit action {} is not installed: copy \
-             contrib/polkit/net.rbw.unlock.policy to \
-             /usr/share/polkit-1/actions/ (as root)",
-            rbw::biometric::POLKIT_ACTION
-        ));
-    }
     ensure_agent()?;
-    let store = crate::actions::biometric_enroll(store)?;
+    let store = crate::actions::remember_password(store)?;
 
     let mut config = rbw::config::Config::load()?;
-    config.biometric = true;
-    config.biometric_store = Some(store);
+    config.saved_password = Some(store);
     config.save()?;
     println!("master password saved in {}", store.name());
 
     Ok(())
 }
 
-pub fn biometric_disable() -> anyhow::Result<()> {
+pub fn forget_password() -> anyhow::Result<()> {
     if crate::actions::status()?.is_some() {
-        crate::actions::biometric_disable()?;
-    } else if let Some(store) = rbw::config::Config::load()?.biometric_store {
+        crate::actions::forget_password()?;
+    } else if let Some(store) = rbw::config::Config::load()?.saved_password {
         block_on(rbw::biometric::forget(store))?;
     }
     let mut config = rbw::config::Config::load()?;
-    config.biometric = false;
-    config.biometric_store = None;
+    config.saved_password = None;
     config.save()?;
 
     Ok(())
 }
 
-pub fn biometric_status() -> anyhow::Result<()> {
+pub fn pin_set() -> anyhow::Result<()> {
+    unlock()?;
+    crate::actions::pin_set()?;
+    println!("pin set");
+
+    Ok(())
+}
+
+pub fn pin_clear() -> anyhow::Result<()> {
+    if crate::actions::status()?.is_some() {
+        crate::actions::pin_clear()?;
+    } else {
+        rbw::pin::clear()?;
+    }
+
+    Ok(())
+}
+
+pub fn security() -> anyhow::Result<()> {
     let config = rbw::config::Config::load()?;
     let yes_no = |b: bool| if b { "yes" } else { "no" };
-    println!("enabled:        {}", yes_no(config.biometric));
+    let timeout = if config.lock_timeout == 0 {
+        "never (until the agent stops)".to_string()
+    } else {
+        humantime::format_duration(std::time::Duration::from_secs(
+            config.lock_timeout,
+        ))
+        .to_string()
+    };
+    println!("lock_timeout      {timeout}");
+    println!("lock_on_sleep     {}", yes_no(config.lock_on_sleep));
+    println!("lock_on_idle      {}", yes_no(config.lock_on_idle));
     println!(
-        "saved password: {}",
-        config
-            .biometric_store
-            .map_or("none (first unlock asks for it)", |s| s.name())
+        "timeout_action    {} ({})",
+        config.timeout_action.name(),
+        match config.timeout_action {
+            rbw::config::TimeoutAction::Lock => {
+                "keep the keys for pin or system unlock"
+            }
+            rbw::config::TimeoutAction::Forget => {
+                "the master password is needed"
+            }
+        }
     );
+    println!("pin               {}", yes_no(rbw::pin::is_set()));
+    println!("system_auth       {}", yes_no(config.system_auth));
     println!(
-        "polkit action:  {}",
+        "saved password    {}",
+        config.saved_password.map_or(
+            "no (the first unlock after a restart needs the master password)",
+            rbw::biometric::SecretStore::name
+        )
+    );
+    println!();
+    println!(
+        "polkit action     {}",
         if block_on(rbw::biometric::polkit_available()) {
             "installed"
         } else {
-            "missing (contrib/polkit/net.rbw.unlock.policy)"
+            "missing (contrib/polkit/README.md)"
         }
     );
     println!(
-        "tpm2:           {}",
+        "tpm2              {}",
         yes_no(block_on(rbw::biometric::has_tpm2()))
     );
     println!(
-        "default store:  {}",
+        "password store    {}",
         block_on(rbw::biometric::default_store())
             .map_or("none available", rbw::biometric::SecretStore::name)
     );

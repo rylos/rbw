@@ -10,6 +10,7 @@ use clap::{CommandFactory as _, Parser as _};
 mod actions;
 mod commands;
 mod items;
+mod settings;
 mod sock;
 mod tui;
 
@@ -162,32 +163,12 @@ enum AttachmentCommand {
 }
 
 #[derive(Debug, clap::Subcommand)]
-enum BiometricCommand {
-    #[command(
-        about = "Save the master password so that unlocking only needs \
-            polkit (face, fingerprint or account password)",
-        long_about = "Save the master password so that unlocking only \
-            needs polkit (face, fingerprint or account password)\n\n\
-            The password is encrypted with systemd-creds (tied to this \
-            machine, with the TPM2 when there is one) or kept in the Secret \
-            Service. Any program running as you can read it back: \
-            biometrics protect against someone at the keyboard, not against \
-            malware. Needs the net.rbw.unlock polkit action (contrib/polkit)."
-    )]
-    Enroll {
-        #[arg(
-            long,
-            help = "Where to save it: systemd-creds or secret-service \
-                (default: systemd-creds when it works)"
-        )]
-        store: Option<String>,
-    },
-    #[command(
-        about = "Forget the saved master password and unlock with it again"
-    )]
-    Disable,
-    #[command(about = "Show what biometric unlock can use on this machine")]
-    Status,
+enum PinCommand {
+    #[command(about = "Choose a pin to unlock with (the agent must be \
+        unlocked)")]
+    Set,
+    #[command(about = "Stop unlocking with a pin")]
+    Clear,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -227,11 +208,63 @@ enum Opt {
         json: bool,
     },
 
-    #[command(about = "Set up unlocking with polkit (face, fingerprint)")]
-    Biometric {
+    #[command(
+        about = "Show how rbw locks and unlocks, and what this machine \
+            supports",
+        long_about = "Show how rbw locks and unlocks, and what this \
+            machine supports\n\n\
+            Like the official clients' security settings:\n\n  \
+            rbw config set lock_timeout 1h|4h|90m|never   session timeout \
+            (never: until the agent stops)\n  \
+            rbw config set lock_on_sleep true             also when the \
+            system wakes up\n  \
+            rbw config set lock_on_idle true              also when the \
+            session idles or the screen locks\n  \
+            rbw config set timeout_action lock|forget     keep the keys \
+            for a pin or system unlock, or need the master password\n  \
+            rbw pin set                                   unlock with a \
+            PIN\n  \
+            rbw config set system_auth true               unlock through \
+            polkit (face, fingerprint)\n  \
+            rbw remember-password                         pin and system \
+            unlock also after a restart"
+    )]
+    Security,
+
+    #[command(about = "Set or clear the pin that unlocks rbw")]
+    Pin {
         #[command(subcommand)]
-        biometric: BiometricCommand,
+        pin: PinCommand,
     },
+
+    #[command(
+        name = "remember-password",
+        about = "Save the master password, so that pin and system unlock \
+            also work for the first unlock after the agent starts",
+        long_about = "Save the master password, so that pin and system \
+            unlock also work for the first unlock after the agent \
+            starts\n\n\
+            Like unchecking \"require the master password on restart\" \
+            in the official clients. The password is encrypted with \
+            systemd-creds (tied to this machine, with the TPM2 when there \
+            is one) or kept in the Secret Service. Any program running as \
+            you can read it back: a pin or biometrics protect against \
+            someone at the keyboard, not against malware."
+    )]
+    RememberPassword {
+        #[arg(
+            long,
+            help = "Where to save it: systemd-creds or secret-service \
+                (default: systemd-creds when it works)"
+        )]
+        store: Option<String>,
+    },
+
+    #[command(
+        name = "forget-password",
+        about = "Delete the saved master password"
+    )]
+    ForgetPassword,
 
     #[command(about = "Update the local copy of the Bitwarden database")]
     Sync,
@@ -521,10 +554,10 @@ enum Opt {
     #[command(
         about = "Lock the password database",
         long_about = "Lock the password database\n\n\
-            With biometric unlock the agent keeps the keys in memory and \
-            stops using them until polkit authorizes an unlock; --hard \
-            drops them, so that the next unlock needs the master password \
-            (or the saved one)."
+            With a pin or system unlock (and timeout_action lock) the \
+            agent keeps the keys in memory and stops using them until one \
+            of those unlocks; --hard drops them, so that the next unlock \
+            needs the master password."
     )]
     Lock {
         #[arg(long, help = "Drop the keys from memory")]
@@ -555,7 +588,10 @@ impl Opt {
             Self::Unlock => "unlock".to_string(),
             Self::Unlocked => "unlocked".to_string(),
             Self::Status { .. } => "status".to_string(),
-            Self::Biometric { .. } => "biometric".to_string(),
+            Self::Security => "security".to_string(),
+            Self::Pin { .. } => "pin".to_string(),
+            Self::RememberPassword { .. } => "remember-password".to_string(),
+            Self::ForgetPassword => "forget-password".to_string(),
             Self::Sync => "sync".to_string(),
             Self::Tui => "tui".to_string(),
             Self::List { .. } => "list".to_string(),
@@ -651,13 +687,15 @@ fn main() {
         Opt::Unlock => commands::unlock(),
         Opt::Unlocked => commands::unlocked(),
         Opt::Status { json } => commands::status(json),
-        Opt::Biometric { biometric } => match biometric {
-            BiometricCommand::Enroll { store } => {
-                commands::biometric_enroll(store.as_deref())
-            }
-            BiometricCommand::Disable => commands::biometric_disable(),
-            BiometricCommand::Status => commands::biometric_status(),
+        Opt::Security => commands::security(),
+        Opt::Pin { pin } => match pin {
+            PinCommand::Set => commands::pin_set(),
+            PinCommand::Clear => commands::pin_clear(),
         },
+        Opt::RememberPassword { store } => {
+            commands::remember_password(store.as_deref())
+        }
+        Opt::ForgetPassword => commands::forget_password(),
         Opt::Sync => commands::sync(),
         Opt::Tui => tui::run(),
         Opt::List { fields, raw } => commands::list(&fields, raw),

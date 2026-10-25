@@ -67,6 +67,10 @@ pub fn biometric_credential_file() -> std::path::PathBuf {
     data_dir().join("biometric.cred")
 }
 
+pub fn pin_file() -> std::path::PathBuf {
+    data_dir().join("pin.json")
+}
+
 pub fn usage_file() -> std::path::PathBuf {
     data_dir().join("usage.json")
 }

@@ -9,6 +9,7 @@ mod sock;
 mod ssh_agent;
 mod state;
 mod timeout;
+mod watch;
 
 async fn tokio_main(
     startup_ack: Option<crate::daemon::StartupAck>,
@@ -44,8 +45,9 @@ async fn tokio_main(
             last_environment: rbw::protocol::Environment::from_process(),
             api_key: None,
             login_expired_notified: false,
-            biometric: config.biometric,
+            settings: crate::state::Settings::from_config(&config),
             soft_locked: false,
+            pin_failures: 0,
             #[cfg(feature = "clipboard")]
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|e| {
@@ -58,6 +60,8 @@ async fn tokio_main(
         crate::agent::Agent::new(timer_r, sync_timer_r, state.clone());
 
     let ssh_agent = crate::ssh_agent::SshAgent::new(state.clone());
+
+    tokio::spawn(crate::watch::run(state.clone()));
 
     tokio::try_join!(agent.run(listener), ssh_agent.run())?;
 

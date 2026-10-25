@@ -1,49 +1,77 @@
 # `tui` branch: status
 
 Work in progress on top of `enhanced` (which stays the stable, public
-branch). Goal: replace the official desktop client with a fast TUI, biometric
-unlock (polkit + howdy/fprintd, also for the first unlock) and, separately, a
-Noctalia bar plugin. A browser extension talking to the agent comes last, if
-at all.
+branch: don't merge until this is finished and tested on the real vault).
+Goal: replace the official desktop client with a fast TUI, unlock options
+like the official clients (pin, system authentication with howdy/fprintd,
+also after a restart) and, as a separate project, a Noctalia bar plugin. A
+browser extension talking to the agent comes last, if at all.
+
+Constraint: rofi-rbw must keep working exactly as today (`list --raw`,
+`get --raw`, `code`, `sync` unchanged; e2e section "rofi-rbw" runs its real
+code).
 
 ## Done
 
-### Phase 1: agent (protocol 2, `rbw stop-agent` after installing)
-- `rbw biometric enroll|disable|status`, config `biometric`,
-  `biometric_store` (`src/biometric.rs`, `contrib/polkit/`).
-  - unlock asks polkit for `net.rbw.unlock` (`pkcheck`, subject = the client
-    process from SO_PEERCRED, the agent itself for ssh-agent requests);
-    refused or unavailable → pinentry as before.
-  - lock with biometric keeps the keys (`soft_locked`), `State::key()` returns
-    nothing while locked; `rbw lock --hard`, logout and disable drop them.
-  - first unlock: master password saved with `systemd-creds --user
-    --with-key=auto` (TPM2 + host key, host key without a TPM) or the Secret
-    Service (`secret-tool`, item `service rbw account rbw-biometric`).
-- `rbw status [--json]`: never starts the agent or prompts (for bars).
-- usage ranking (`src/usage.rs`, ids only, half-life 14 days): `get` and
-  `code` record, `sort_by_usage` sorts `list`/`search`.
-- e2e: 70/70 (`tests/vw/e2e.sh`, polkit faked with a fake `pkcheck`).
+### Agent (protocol 2: `rbw stop-agent` after installing)
+Lock and unlock settings, mirroring the official "Security" page:
+
+| official | rbw |
+|---|---|
+| session timeout 1 min … 4 h, custom | `lock_timeout 1h`, `90m`, seconds |
+| on restart / never | `lock_timeout never` (0) |
+| when the system is idle | `lock_on_idle` (logind IdleHint/LockedHint, `watch.rs`) |
+| when the system sleeps | `lock_on_sleep` (BOOTTIME − MONOTONIC jump) |
+| timeout action lock / log out | `timeout_action lock` / `forget` |
+| unlock with PIN | `rbw pin set` / `rbw pin clear` (`src/pin.rs`, argon2id, 5 tries) |
+| unlock with system authentication | `system_auth` (polkit `net.rbw.unlock`) |
+| require master password on restart | unchecked = `rbw remember-password` |
+
+- unlock order: system (polkit) → pin → master password; the first two
+  only when there is something to reuse (kept keys or saved password).
+- `timeout_action lock` with pin or system auth keeps the keys
+  (`soft_locked`, `State::key()` returns nothing); otherwise, and with
+  `lock --hard`, logout, `forget`, the keys are dropped.
+- saved master password: `systemd-creds --user --with-key=auto` (TPM2 +
+  host key; host key without TPM) or Secret Service (`service rbw account
+  rbw-biometric`), `src/biometric.rs`.
+- lock settings are applied live (`ReloadConfig`), the agent isn't
+  restarted; config saved atomically.
+- `rbw security` overview, `rbw status [--json]` (never starts the agent or
+  prompts: for bars).
+- usage ranking (`src/usage.rs`, ids only): `get`/`code` record,
+  `sort_by_usage` sorts `list`/`search`, the tui always uses it.
+
+### TUI (`rbw tui`, `src/bin/rbw/tui.rs`, `settings.rs`)
+- fuzzy filter (nucleo), usage first; Enter copies, Tab picks a field,
+  ^U ^T ^R ^O ^E ^N ^D ^S ^L, F1 help, F2 security settings.
+- clipboard cleared by the agent after 30 s; details dropped as soon as
+  the agent locks, unlock again before the next key needing a secret.
+- startup ≈ `rbw list` (≈ 40 ms on the real 1681-entry vault).
+
+### Tests
+- `bash tests/vw/e2e.sh`: 93/93 (polkit faked; tui driven with tmux).
+- `tests/vw/dev-vault.sh`: throwaway vault on :8223 for trying the tui
+  (`PATH=target/debug:$PATH RBW_PROFILE=rbwdev rbw tui`).
+- Real polkit + howdy tested on pc-casa with the dev vault: first unlock
+  (saved password, TPM2) 3.7 s in a debug build, re-unlock 1.2 s.
 
 ## Machine setup done (pc-casa, 2026-10-25)
 - `/usr/share/polkit-1/actions/net.rbw.unlock.policy`
 - `/etc/pam.d/polkit-1` = contrib/polkit/polkit-1.pam (howdy on top;
   remove the file to go back to `/usr/lib/pam.d/polkit-1`)
 - `/etc/systemd/system/polkit-agent-helper@.service.d/biometric.conf`:
-  without it the sandboxed helper can't open the camera. Verified: `pkcheck`
-  → howdy "Login approved" in 1.3 s.
-- pc-work: none of this yet (needs the same three files; check which camera
-  howdy uses there).
+  without it the sandboxed helper can't open the camera ("not possible to
+  open camera"), which is also why the official client's system unlock
+  never used howdy.
+- pc-work: none of this yet (same three files; check howdy's camera there).
+- The real vault still runs the `enhanced` package (rbw-enhanced): nothing
+  of this branch is installed.
 
 ## Next
-- Phase 2: `rbw tui` (ratatui + nucleo), see plan below.
-- Phase 3: Noctalia plugin in rylos/community-plugins (separate project, only
-  uses `rbw status --json` and plain `rbw` commands).
-- Phase 4 (maybe): browser extension via native messaging.
-
-## TUI plan
-- subcommand of the `rbw` binary (reuses the client's decrypt and edit code).
-- one `DecryptMany` round trip for name/user/folder/uris, fuzzy filter in
-  memory, sorted by usage then name; secrets decrypted only on demand.
-- keys: type to filter, ↑/↓, Enter copy password, `u` user, `t` TOTP,
-  `o` open URI, `e` edit ($EDITOR form), `n` new, `d` trash, `s` sync,
-  `l` lock, `?` help, Esc/Ctrl-C quit; clipboard cleared after 30 s.
+1. Try it on the real vault: build a package from this branch, `rbw
+   stop-agent`, check rofi-rbw, then pick the settings (F2).
+2. Noctalia plugin in rylos/community-plugins (separate project: only uses
+   `rbw status --json` and plain `rbw` commands).
+3. README of the fork: document the new commands when merging.
+4. Maybe: browser extension via native messaging to the agent.

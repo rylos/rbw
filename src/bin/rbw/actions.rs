@@ -80,16 +80,16 @@ pub fn status() -> anyhow::Result<Option<rbw::protocol::Status>> {
     }
 }
 
-pub fn biometric_enroll(
+pub fn remember_password(
     store: Option<rbw::biometric::SecretStore>,
 ) -> anyhow::Result<rbw::biometric::SecretStore> {
     let mut sock = connect()?;
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
-        rbw::protocol::Action::BiometricEnroll { store },
+        rbw::protocol::Action::RememberPassword { store },
     ))?;
     match sock.recv()? {
-        rbw::protocol::Response::BiometricEnroll { store } => Ok(store),
+        rbw::protocol::Response::RememberPassword { store } => Ok(store),
         rbw::protocol::Response::Error { error } => {
             Err(anyhow::anyhow!("{error}"))
         }
@@ -97,8 +97,20 @@ pub fn biometric_enroll(
     }
 }
 
-pub fn biometric_disable() -> anyhow::Result<()> {
-    simple_action(rbw::protocol::Action::BiometricDisable)
+pub fn forget_password() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ForgetPassword)
+}
+
+pub fn pin_set() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::PinSet)
+}
+
+pub fn pin_clear() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::PinClear)
+}
+
+pub fn reload_config() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ReloadConfig)
 }
 
 pub fn quit() -> anyhow::Result<()> {

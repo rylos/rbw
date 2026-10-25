@@ -154,8 +154,8 @@ async fn handle_request(
             crate::actions::status(sock, state.clone()).await?;
             false
         }
-        rbw::protocol::Action::BiometricEnroll { store } => {
-            crate::actions::biometric_enroll(
+        rbw::protocol::Action::RememberPassword { store } => {
+            crate::actions::remember_password(
                 sock,
                 state.clone(),
                 &environment,
@@ -164,8 +164,21 @@ async fn handle_request(
             .await?;
             false
         }
-        rbw::protocol::Action::BiometricDisable => {
-            crate::actions::biometric_disable(sock, state.clone()).await?;
+        rbw::protocol::Action::ForgetPassword => {
+            crate::actions::forget_password(sock, state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::PinSet => {
+            crate::actions::pin_set(sock, state.clone(), &environment)
+                .await?;
+            false
+        }
+        rbw::protocol::Action::PinClear => {
+            crate::actions::pin_clear(sock, state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::ReloadConfig => {
+            crate::actions::reload_config(sock, state.clone()).await?;
             false
         }
         rbw::protocol::Action::Sync => {

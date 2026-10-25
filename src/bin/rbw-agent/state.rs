@@ -29,13 +29,44 @@ pub struct State {
     pub api_key: Option<rbw::locked::ApiKey>,
     pub login_expired_notified: bool,
 
-    // with biometric unlock, locking keeps the keys but stops using them
-    // until polkit authorizes an unlock
-    pub biometric: bool,
+    // how locking and unlocking work, from the config (reloaded without
+    // restarting the agent)
+    pub settings: Settings,
+    // with a pin or system unlock, locking keeps the keys but stops using
+    // them until one of those unlocks
     pub soft_locked: bool,
+    pub pin_failures: u8,
 
     #[cfg(feature = "clipboard")]
     pub clipboard: Option<arboard::Clipboard>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Settings {
+    pub system_auth: bool,
+    pub pin: bool,
+    pub saved_password: Option<rbw::biometric::SecretStore>,
+    pub timeout_action: rbw::config::TimeoutAction,
+    pub lock_on_sleep: bool,
+    pub lock_on_idle: bool,
+}
+
+impl Settings {
+    pub fn from_config(config: &rbw::config::Config) -> Self {
+        Self {
+            system_auth: config.system_auth,
+            pin: rbw::pin::is_set(),
+            saved_password: config.saved_password,
+            timeout_action: config.timeout_action,
+            lock_on_sleep: config.lock_on_sleep,
+            lock_on_idle: config.lock_on_idle,
+        }
+    }
+
+    // whether a lock can keep the keys
+    pub fn quick_unlock(self) -> bool {
+        self.system_auth || self.pin
+    }
 }
 
 impl State {
@@ -56,14 +87,23 @@ impl State {
         self.priv_key.is_some() && self.org_keys.is_some()
     }
 
+    // a zero lock timeout never locks
     pub fn set_timeout(&self) {
-        self.timeout.set(self.timeout_duration);
+        if self.timeout_duration.is_zero() {
+            self.timeout.clear();
+        } else {
+            self.timeout.set(self.timeout_duration);
+        }
     }
 
-    // lock: with biometric unlock the keys stay in memory, so that the next
-    // unlock only needs polkit
+    // lock: with a pin or system unlock and timeout_action lock the keys
+    // stay in memory, so that the next unlock only needs one of those
     pub fn clear(&mut self) {
-        if self.biometric && self.has_keys() {
+        if self.settings.quick_unlock()
+            && self.settings.timeout_action
+                == rbw::config::TimeoutAction::Lock
+            && self.has_keys()
+        {
             self.soft_locked = true;
             self.timeout.clear();
         } else {

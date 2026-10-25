@@ -222,48 +222,116 @@ setdb '.access_token="x.eyJzdWIiOiJ4In0.x"'
 RBW_TEST_APIKEY_ID=$ID RBW_TEST_APIKEY_SECRET=$SECRET rbw sync
 check "background sync logs in again after agent restart" pw-api "$(rbw get flags)"
 
-echo "== biometric unlock"
+echo "== unlock options"
 # polkit is faked (the real one needs someone at the keyboard): pkcheck logs
-# each call and answers with the exit code in pk.answer. systemd-creds is the
-# real one when it supports user credentials.
+# each call and answers with the exit code in pk.answer. The pinentry
+# answers PIN prompts from pin.answer, and logs every call. systemd-creds is
+# the real one.
 printf '#!/bin/sh\nexit 0\n' >"$WORK/bin/pkaction"
 printf '#!/bin/sh\necho "$*" >> %s/pkcheck.log\nexit "$(cat %s/pk.answer)"\n' "$WORK" "$WORK" >"$WORK/bin/pkcheck"
-chmod +x "$WORK/bin/pkaction" "$WORK/bin/pkcheck"
+cat >"$WORK/bin/pinentry-pin" <<PINENTRY
+#!/bin/sh
+echo call >> $WORK/pinentry.log
+echo "OK Pleased to meet you"
+pin=""
+while IFS= read -r line; do
+  case "\$line" in
+    SETPROMPT\ PIN*) pin=1; echo OK ;;
+    GETPIN*) if [ -n "\$pin" ]; then echo "D \$(cat $WORK/pin.answer)"; else echo "D $PW"; fi; pin=""; echo OK ;;
+    BYE*) echo "OK closing connection"; exit 0 ;;
+    *) echo OK ;;
+  esac
+done
+PINENTRY
+chmod +x "$WORK/bin/pkaction" "$WORK/bin/pkcheck" "$WORK/bin/pinentry-pin"
 echo 0 >"$WORK/pk.answer"
-rbw config set pinentry "$WORK/bin/pinentry-log"
+echo 2468 >"$WORK/pin.answer"
+CONF="$HOME/.config/rbw-rbwtest/config.json"
+agent_pid() { cat "${XDG_RUNTIME_DIR:-/tmp}/rbw-rbwtest/pidfile" 2>/dev/null; }
+reset_logs() { : >"$WORK/pinentry.log"; : >"$WORK/pkcheck.log"; }
+prompts() { wc -l <"$WORK/pinentry.log"; }
+pkchecks() { wc -l <"$WORK/pkcheck.log"; }
+rbw config set pinentry "$WORK/bin/pinentry-pin"
 rbw unlock
-: >"$WORK/pinentry.log"
-rbw biometric enroll
-STORE=$(jq -r .biometric_store "$HOME/.config/rbw-rbwtest/config.json")
-check "enroll asks for the master password once" 1 "$(wc -l <"$WORK/pinentry.log")"
-check "enroll enables biometric unlock" true "$(jq .biometric "$HOME/.config/rbw-rbwtest/config.json")"
+reset_logs
+
+rbw remember-password
+check "remember-password asks for the master password once" 1 "$(prompts)"
+STORE=$(jq -r .saved_password "$CONF")
+PID=$(agent_pid)
+rbw config set system_auth true
+check "changing a lock setting keeps the agent running" "$PID" "$(agent_pid)"
+check "  and unlocked" false "$(rbw status --json | jq .locked)"
+
 rbw lock
 check "lock keeps the keys" '[true,true]' "$(rbw status --json | jq -c '[.locked, .keys_in_memory]')"
 check "a locked agent refuses to decrypt" 1 "$(echo '{"environment":null,"action":{"type":"Decrypt","cipherstring":"'"$(jq -r '.entries[0].name' "$(db)")"'","entry_key":null,"org_id":null}}' | SOCK="${XDG_RUNTIME_DIR:-/tmp}/rbw-rbwtest/socket" python3 -I -c '
 import socket,sys,os
 s=socket.socket(socket.AF_UNIX); s.connect(os.environ["SOCK"]); s.sendall(sys.stdin.buffer.read()+b"\n")
 print(1 if b"Error" in s.makefile("rb").readline() else 0)')"
-: >"$WORK/pinentry.log"; : >"$WORK/pkcheck.log"
-check "unlock with the kept keys" pw-api "$(rbw get flags)"
-check "  asked polkit once" 1 "$(wc -l <"$WORK/pkcheck.log")"
-check "  and no pinentry" 0 "$(wc -l <"$WORK/pinentry.log")"
+reset_logs
+check "system unlock with the kept keys" pw-api "$(rbw get flags)"
+check "  one polkit check, no pinentry" "1 0" "$(pkchecks) $(prompts)"
+check "  and no more checks while unlocked" pw-api "$(rbw get flags)"
+check "  (still one)" 1 "$(pkchecks)"
 rbw lock --hard
 check "lock --hard drops the keys" false "$(rbw status --json | jq .keys_in_memory)"
-check "unlock with the saved password ($STORE)" pw-api "$(rbw get flags)"
-check "  still no pinentry" 0 "$(wc -l <"$WORK/pinentry.log")"
+reset_logs
+check "system unlock with the saved password ($STORE)" pw-api "$(rbw get flags)"
+check "  no pinentry" 0 "$(prompts)"
 rbw stop-agent
-check "first unlock after the agent starts is biometric" pw-api "$(rbw get flags)"
-check "  still no pinentry" 0 "$(wc -l <"$WORK/pinentry.log")"
+check "system unlock right after the agent starts" pw-api "$(rbw get flags)"
+check "  no pinentry" 0 "$(prompts)"
 echo 1 >"$WORK/pk.answer"
 rbw lock
-check "polkit refused: falls back to the master password" pw-api "$(rbw get flags)"
-check "  with one pinentry" 1 "$(wc -l <"$WORK/pinentry.log")"
+reset_logs
+check "polkit refused: the master password" pw-api "$(rbw get flags)"
+check "  one pinentry" 1 "$(prompts)"
 echo 0 >"$WORK/pk.answer"
-rbw biometric disable
-check "disable forgets the password" '[false,null]' "$(jq -c '[.biometric, .biometric_store]' "$HOME/.config/rbw-rbwtest/config.json")"
-check "  and removes the credential" no "$([ -e "$HOME/.local/share/rbw-rbwtest/biometric.cred" ] && echo yes || echo no)"
+
+rbw config set system_auth false
+reset_logs
+rbw pin set
+check "pin set asks twice" 2 "$(prompts)"
 rbw lock
-check "without biometric, lock drops the keys" false "$(rbw status --json | jq .keys_in_memory)"
+check "with a pin, lock keeps the keys" true "$(rbw status --json | jq .keys_in_memory)"
+reset_logs
+check "pin unlock" pw-api "$(rbw get flags)"
+check "  one pinentry, no polkit" "1 0" "$(prompts) $(pkchecks)"
+rbw stop-agent
+reset_logs
+check "pin unlock after a restart (saved password)" pw-api "$(rbw get flags)"
+check "  one pinentry" 1 "$(prompts)"
+echo 0000 >"$WORK/pin.answer"
+rbw lock
+reset_logs
+check "five wrong pins: the master password" pw-api "$(rbw get flags)"
+check "  five pin prompts and one for the password" 6 "$(prompts)"
+echo 2468 >"$WORK/pin.answer"
+rbw lock
+reset_logs
+check "the right pin works again after the master password" pw-api "$(rbw get flags)"
+check "  one pinentry" 1 "$(prompts)"
+
+rbw config set timeout_action forget
+rbw lock
+check "timeout_action forget drops the keys" false "$(rbw status --json | jq .keys_in_memory)"
+rbw config set timeout_action lock
+rbw get flags >/dev/null
+rbw config set lock_timeout 2
+rbw get flags >/dev/null
+for _ in $(seq 1 40); do [ "$(rbw status --json | jq .locked)" = true ] && break; sleep 0.1; done
+check "lock_timeout 2 locks after two seconds" '[true,true]' "$(rbw status --json | jq -c '[.locked, .keys_in_memory]')"
+rbw config set lock_timeout never
+check "lock_timeout never is stored as 0" 0 "$(jq .lock_timeout "$CONF")"
+rbw config set lock_timeout 4h
+check "lock_timeout 4h" 14400 "$(jq .lock_timeout "$CONF")"
+
+rbw pin clear
+rbw lock
+check "without pin or system unlock, lock drops the keys" false "$(rbw status --json | jq .keys_in_memory)"
+rbw forget-password
+check "forget-password removes the credential" '[null,"no"]' "$(jq -c '[.saved_password]' "$CONF" | jq -c '. + ["'"$([ -e "$HOME/.local/share/rbw-rbwtest/biometric.cred" ] && echo yes || echo no)"'"]')"
 rbw config set pinentry "$ROOT/tests/vw/pinentry-test"
 
 echo "== status and usage"
@@ -287,7 +355,7 @@ if command -v tmux >/dev/null; then
     }
     tmux kill-session -t rbw-e2e 2>/dev/null || true
     tmux new-session -d -s rbw-e2e -x 120 -y 30 "env PATH='$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
-    check "tui starts with every entry listed" 0 "$(wait_screen "/$(rbw list | wc -l) " ; echo $?)"
+    check "tui starts with every entry listed" 0 "$(wait_screen "/$(rbw list | wc -l)\$" ; echo $?)"
     tmux send-keys -t rbw-e2e 'flags'
     check "typing filters" 0 "$(wait_screen ' 1/' ; echo $?)"
     check "secrets are masked" 0 "$(wait_screen '••••' ; echo $?)"
@@ -295,12 +363,14 @@ if command -v tmux >/dev/null; then
     check "^R reveals them" 0 "$(wait_screen 'pw-api' ; echo $?)"
     rbw lock
     check "a lock elsewhere hides the details" 0 "$(wait_screen 'locked: Enter' ; echo $?)"
-    check "  and the secrets are gone from the screen" 1 "$(screen | grep -c 'pw-api')"
+    check "  and the secrets are gone from the screen" 0 "$(screen | grep -c 'pw-api')"
     tmux send-keys -t rbw-e2e Tab
     check "Tab unlocks again" 0 "$(wait_screen 'password' ; echo $?)"
-    tmux send-keys -t rbw-e2e Escape Escape
+    # back from the fields, clear the filter, quit
+    # one at a time: escapes sent together read as alt sequences
+    for _ in 1 2 3; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done
     for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
-    check "Esc twice quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
+    check "Esc quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
 else
     echo "skipped (no tmux)"
 fi

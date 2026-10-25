@@ -418,14 +418,21 @@ async fn unlock_state(
         return Ok(());
     }
 
-    if state.lock().await.biometric {
-        match biometric_unlock(state.clone(), peer).await {
+    let settings = state.lock().await.settings;
+    let reusable =
+        state.lock().await.has_keys() || settings.saved_password.is_some();
+    if reusable && settings.system_auth {
+        match system_unlock(state.clone(), peer).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(e) => log::warn!(
-                "biometric unlock failed, asking for the master password: \
-                 {e:#}"
-            ),
+            Err(e) => log::warn!("system unlock failed: {e:#}"),
+        }
+    }
+    if reusable && settings.pin {
+        match pin_unlock(state.clone(), environment).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => log::warn!("pin unlock failed: {e:#}"),
         }
     }
 
@@ -519,57 +526,107 @@ fn unlock_keys(
     ))
 }
 
-// Ok(false) when biometric unlock isn't possible or the user didn't
-// authorize it: the caller then asks for the master password
-async fn biometric_unlock(
+// after a system or pin unlock: start using the kept keys again, or unlock
+// with the saved master password
+async fn reuse_keys(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
-    peer: Option<u32>,
-) -> anyhow::Result<bool> {
-    let kept_keys = state.lock().await.has_keys();
-    let store = rbw::config::Config::load_async().await?.biometric_store;
-    if !kept_keys && store.is_none() {
-        return Ok(false);
-    }
-    if !rbw::biometric::polkit_available().await {
-        return Err(anyhow::anyhow!(
-            "the polkit action {} is not installed",
-            rbw::biometric::POLKIT_ACTION
-        ));
+) -> anyhow::Result<()> {
+    {
+        let mut state = state.lock().await;
+        if state.has_keys() {
+            state.soft_locked = false;
+            state.pin_failures = 0;
+            return Ok(());
+        }
     }
 
-    let pid = peer.unwrap_or_else(std::process::id);
-    if !rbw::biometric::authorize(pid).await? {
-        log::info!("biometric unlock not authorized");
-        return Ok(false);
-    }
-
-    if kept_keys {
-        state.lock().await.soft_locked = false;
-        return Ok(true);
-    }
-
-    // checked above
-    let store = store.unwrap();
+    let Some(store) = state.lock().await.settings.saved_password else {
+        return Err(anyhow::anyhow!("no saved master password"));
+    };
     let Some(password) = rbw::biometric::load(store).await? else {
         return Err(anyhow::anyhow!(
-            "no master password saved in {}, run `rbw biometric enroll`",
+            "no master password saved in {}, run `rbw remember-password`",
             store.name()
         ));
     };
     let db = load_db().await?;
     let email = config_email().await?;
     match unlock_keys(&db, &email, &password)? {
-        Ok((keys, org_keys)) => {
-            unlock_success(state, keys, org_keys).await?;
-            Ok(true)
-        }
+        Ok((keys, org_keys)) => unlock_success(state, keys, org_keys).await,
         Err(rbw::error::Error::IncorrectPassword { .. }) => {
             Err(anyhow::anyhow!(
                 "the saved master password is wrong (changed?), run \
-                 `rbw biometric enroll` again"
+                 `rbw remember-password` again"
             ))
         }
         Err(e) => Err(e).context("failed to unlock database"),
+    }
+}
+
+// Ok(false) when the user didn't authorize it: the caller then tries the pin
+// or the master password
+async fn system_unlock(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    peer: Option<u32>,
+) -> anyhow::Result<bool> {
+    if !rbw::biometric::polkit_available().await {
+        return Err(anyhow::anyhow!(
+            "the polkit action {} is not installed",
+            rbw::biometric::POLKIT_ACTION
+        ));
+    }
+    let pid = peer.unwrap_or_else(std::process::id);
+    if !rbw::biometric::authorize(pid).await? {
+        log::info!("system unlock not authorized");
+        return Ok(false);
+    }
+    reuse_keys(state).await?;
+    Ok(true)
+}
+
+// Ok(false) when the pinentry was cancelled or too many wrong pins were
+// given (then the kept keys are dropped)
+async fn pin_unlock(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<bool> {
+    let mut err_msg: Option<String> = None;
+    loop {
+        let failures = state.lock().await.pin_failures;
+        if failures >= rbw::pin::MAX_FAILURES {
+            return Ok(false);
+        }
+        let pin = match rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "PIN",
+            &format!(
+                "Unlock '{}' with your PIN (cancel for the master password)",
+                rbw::dirs::profile()
+            ),
+            err_msg.as_deref(),
+            environment,
+            true,
+        )
+        .await
+        {
+            Ok(pin) => pin,
+            Err(rbw::error::Error::PinentryCancelled) => return Ok(false),
+            Err(e) => return Err(e).context("failed to read the pin"),
+        };
+        if rbw::pin::verify(&pin)? {
+            reuse_keys(state).await?;
+            return Ok(true);
+        }
+        let mut state_guard = state.lock().await;
+        state_guard.pin_failures += 1;
+        let left = rbw::pin::MAX_FAILURES - state_guard.pin_failures;
+        if left == 0 {
+            log::warn!("too many wrong pins, the master password is needed");
+            state_guard.forget_keys();
+            return Ok(false);
+        }
+        drop(state_guard);
+        err_msg = Some(format!("Wrong PIN ({left} attempts left)"));
     }
 }
 
@@ -594,6 +651,7 @@ async fn unlock_success(
     state.priv_key = Some(keys);
     state.org_keys = Some(org_keys);
     state.soft_locked = false;
+    state.pin_failures = 0;
     Ok(())
 }
 
@@ -622,7 +680,9 @@ pub async fn status(
         rbw::protocol::Status {
             locked: state.needs_unlock(),
             keys_in_memory: state.soft_locked && state.has_keys(),
-            biometric: state.biometric,
+            system_auth: state.settings.system_auth,
+            pin: state.settings.pin,
+            saved_password: state.settings.saved_password.is_some(),
             login_expired: state.login_expired_notified,
         }
     };
@@ -631,7 +691,7 @@ pub async fn status(
     Ok(())
 }
 
-pub async fn biometric_enroll(
+pub async fn remember_password(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
@@ -654,7 +714,7 @@ pub async fn biometric_enroll(
         let password = rbw::pinentry::getpin(
             &config_pinentry().await?,
             "Master Password",
-            "Save the master password for biometric unlock",
+            "Save the master password for pin and system unlock",
             err_msg.as_deref(),
             environment,
             true,
@@ -694,26 +754,111 @@ pub async fn biometric_enroll(
         ));
     }
 
-    state.lock().await.biometric = true;
-    sock.send(&rbw::protocol::Response::BiometricEnroll { store })
+    state.lock().await.settings.saved_password = Some(store);
+    sock.send(&rbw::protocol::Response::RememberPassword { store })
         .await?;
 
     Ok(())
 }
 
-pub async fn biometric_disable(
+pub async fn forget_password(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
-    if let Some(store) =
-        rbw::config::Config::load_async().await?.biometric_store
-    {
+    let store = state.lock().await.settings.saved_password;
+    if let Some(store) = store {
         rbw::biometric::forget(store).await?;
     }
+    state.lock().await.settings.saved_password = None;
+
+    respond_ack(sock).await?;
+
+    Ok(())
+}
+
+pub async fn pin_set(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    if state.lock().await.needs_unlock() {
+        return Err(anyhow::anyhow!("agent is locked"));
+    }
+    let pinentry = config_pinentry().await?;
+    let mut err_msg: Option<&str> = None;
+    let pin = loop {
+        let pin = rbw::pinentry::getpin(
+            &pinentry,
+            "PIN",
+            "Choose a PIN to unlock rbw",
+            err_msg,
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read the pin")?;
+        if pin.password().is_empty() {
+            err_msg = Some("The PIN can't be empty");
+            continue;
+        }
+        let again = rbw::pinentry::getpin(
+            &pinentry,
+            "PIN",
+            "Type the same PIN again",
+            None,
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read the pin")?;
+        if again.password() == pin.password() {
+            break pin;
+        }
+        err_msg = Some("The PINs didn't match, choose one again");
+    };
+    rbw::pin::set(&pin)?;
     let mut state = state.lock().await;
-    state.biometric = false;
-    if state.soft_locked {
+    state.settings.pin = true;
+    state.pin_failures = 0;
+    drop(state);
+
+    respond_ack(sock).await?;
+
+    Ok(())
+}
+
+pub async fn pin_clear(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    rbw::pin::clear()?;
+    let mut state = state.lock().await;
+    state.settings.pin = false;
+    // a lock that kept the keys for the pin must not keep them now
+    if state.soft_locked && !state.settings.quick_unlock() {
         state.forget_keys();
+    }
+    drop(state);
+
+    respond_ack(sock).await?;
+
+    Ok(())
+}
+
+pub async fn reload_config(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let config = rbw::config::Config::load_async().await?;
+    let mut state = state.lock().await;
+    state.settings = crate::state::Settings::from_config(&config);
+    state.timeout_duration =
+        std::time::Duration::from_secs(config.lock_timeout);
+    if state.soft_locked && !state.settings.quick_unlock() {
+        state.forget_keys();
+    }
+    if !state.needs_unlock() {
+        state.set_timeout();
     }
     drop(state);
 

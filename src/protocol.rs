@@ -186,18 +186,25 @@ pub enum Action {
     Register,
     Unlock,
     CheckLock,
-    // with biometric unlock a lock keeps the keys in memory unless hard
+    // with a pin or system unlock a lock keeps the keys in memory unless
+    // hard
     Lock {
         #[serde(default)]
         hard: bool,
     },
     // what the agent is doing, without unlocking or prompting for anything
     Status,
-    // ask for the master password and save it for biometric unlock
-    BiometricEnroll {
+    // ask for the master password and save it, so that pin and system
+    // unlock also work after the agent starts
+    RememberPassword {
         store: Option<crate::biometric::SecretStore>,
     },
-    BiometricDisable,
+    ForgetPassword,
+    // ask for a new pin (the agent must be unlocked)
+    PinSet,
+    PinClear,
+    // apply changed lock settings without restarting the agent
+    ReloadConfig,
     Sync,
     Decrypt {
         cipherstring: String,
@@ -281,7 +288,7 @@ pub enum Response {
         version: u32,
     },
     Status(Status),
-    BiometricEnroll {
+    RememberPassword {
         store: crate::biometric::SecretStore,
     },
 }
@@ -289,8 +296,10 @@ pub enum Response {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Status {
     pub locked: bool,
-    // locked, but biometric unlock can reuse the keys
+    // locked, but a pin or system unlock can reuse the keys
     pub keys_in_memory: bool,
-    pub biometric: bool,
+    pub system_auth: bool,
+    pub pin: bool,
+    pub saved_password: bool,
     pub login_expired: bool,
 }

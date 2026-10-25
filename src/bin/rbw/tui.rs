@@ -40,6 +40,8 @@ enum Mode {
     Normal,
     ConfirmTrash(String),
     Help,
+    // the selected row
+    Settings(usize),
 }
 
 struct App {
@@ -338,6 +340,7 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Help => return Outcome::None,
+            Mode::Settings(row) => return self.settings_key(key, row),
             Mode::ConfirmTrash(id) => {
                 if matches!(key.code, KeyCode::Char('y' | 'Y')) {
                     return Outcome::Suspend(Box::new(move || {
@@ -391,12 +394,9 @@ impl App {
                     self.detail_line = 0;
                 }
             }
-            KeyCode::BackTab | KeyCode::Left
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left
                 if self.focus == Focus::Details =>
             {
-                self.focus = Focus::List;
-            }
-            KeyCode::Tab if self.focus == Focus::Details => {
                 self.focus = Focus::List;
             }
             KeyCode::Enter => {
@@ -490,6 +490,7 @@ impl App {
                 }
             }
             KeyCode::F(1) => self.mode = Mode::Help,
+            KeyCode::F(2) => self.mode = Mode::Settings(0),
             KeyCode::Char('?') if self.query.is_empty() => {
                 self.mode = Mode::Help;
             }
@@ -590,6 +591,42 @@ impl App {
         Ok(())
     }
 
+    fn settings_key(&mut self, key: KeyEvent, row: usize) -> Outcome {
+        let step = match key.code {
+            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
+                return Outcome::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::Settings(row.saturating_sub(1));
+                return Outcome::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode =
+                    Mode::Settings((row + 1).min(crate::settings::ROWS - 1));
+                return Outcome::None;
+            }
+            KeyCode::Left | KeyCode::Char('h') => -1,
+            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => 1,
+            _ => {
+                self.mode = Mode::Settings(row);
+                return Outcome::None;
+            }
+        };
+        self.mode = Mode::Settings(row);
+        let settings = crate::settings::Settings::load();
+        match crate::settings::change(&settings, row, step) {
+            crate::settings::Change::Done(Ok(msg)) => {
+                self.message(msg, false);
+                Outcome::None
+            }
+            crate::settings::Change::Done(Err(e)) => {
+                self.message(format!("{e:#}"), true);
+                Outcome::None
+            }
+            crate::settings::Change::Prompt(f) => Outcome::Suspend(f),
+        }
+    }
+
     fn check_lock(&mut self) {
         // status, not unlocked: a locked agent answers that with an error,
         // which it logs
@@ -637,6 +674,7 @@ impl App {
 
         match &self.mode {
             Mode::Help => draw_help(f, area),
+            Mode::Settings(row) => draw_settings(f, area, *row),
             Mode::ConfirmTrash(_) => {
                 let name = self.selected().map_or("", |e| e.name.as_str());
                 draw_popup(
@@ -900,6 +938,7 @@ impl App {
                 ("⇥", "fields"),
                 ("^E", "edit"),
                 ("F1", "help"),
+                ("F2", "security"),
             ]
         };
         let mut spans = vec![];
@@ -938,7 +977,7 @@ fn needs_secret(key: &KeyEvent) -> bool {
     }
 }
 
-fn pane<'a>(border: Color, title: &'a str) -> Block<'a> {
+fn pane(border: Color, title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -953,7 +992,7 @@ fn draw_popup(
     lines: Vec<Line>,
 ) {
     let h = u16::try_from(lines.len() + 2).unwrap_or(10);
-    let w = area.width.min(60);
+    let w = area.width.min(72);
     let popup = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -969,6 +1008,83 @@ fn draw_popup(
     );
 }
 
+fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) {
+    let settings = crate::settings::Settings::load();
+    let quick = settings.pin || settings.system_auth;
+    let check = |on: bool| if on { "[x]" } else { "[ ]" };
+    let rows: [(String, String, bool); crate::settings::ROWS] = [
+        (
+            "Session timeout".to_string(),
+            format!("‹ {} ›", settings.timeout_label()),
+            true,
+        ),
+        (
+            "Timeout action".to_string(),
+            format!(
+                "‹ {} ›",
+                if settings.forget { "log out" } else { "lock" }
+            ),
+            true,
+        ),
+        (
+            format!("{} Unlock with PIN", check(settings.pin)),
+            String::new(),
+            true,
+        ),
+        (
+            format!(
+                "{} Unlock with system authentication",
+                check(settings.system_auth)
+            ),
+            String::new(),
+            true,
+        ),
+        (
+            format!(
+                "{} Require the master password on restart",
+                check(!settings.saved_password)
+            ),
+            String::new(),
+            quick,
+        ),
+    ];
+    let mut lines = vec![];
+    for (n, (label, value, enabled)) in rows.iter().enumerate() {
+        let mut style = if n == row {
+            Style::new().bg(Color::Indexed(236)).bold()
+        } else {
+            Style::new()
+        };
+        if !enabled {
+            style = style.fg(DIM);
+        }
+        let marker = if n == row { "▌" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(format!("{label:<22}"), style),
+            Span::styled(value.clone(), style.fg(ACCENT)),
+        ]));
+        if n == 1 {
+            lines.push(Line::from(""));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        crate::settings::Settings::describe(row),
+        Style::new().fg(DIM),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        "↑↓".bold().fg(ACCENT),
+        " choose  ".fg(DIM),
+        "←→ Space".bold().fg(ACCENT),
+        " change  ".fg(DIM),
+        "Esc".bold().fg(ACCENT),
+        " close".fg(DIM),
+    ]));
+    draw_popup(f, area, "Security", lines);
+}
+
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     let rows = [
         ("type", "filter (fuzzy; 'exact ^prefix suffix$ !not)"),
@@ -981,6 +1097,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         ("^E  ^N  ^D", "edit, new (named after the filter), trash"),
         ("^S", "sync"),
         ("^L", "lock and quit"),
+        ("F2", "security settings (timeout, pin, system unlock)"),
         ("^W  Alt-⌫", "delete word, clear filter"),
         ("Esc  ^C", "clear filter / quit"),
     ];
