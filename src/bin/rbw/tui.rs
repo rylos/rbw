@@ -176,9 +176,13 @@ pub fn run(settings: bool) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(anyhow::anyhow!("rbw tui needs a terminal"));
     }
-    crate::commands::tui_ensure_unlocked()?;
+    if let Err(e) = crate::commands::tui_ensure_unlocked() {
+        fail(&e);
+    }
     if rbw::config::Config::load().is_ok_and(|c| c.tui_auth) {
-        crate::actions::authorize_tui()?;
+        if let Err(e) = crate::actions::authorize_tui() {
+            fail(&e);
+        }
     }
     let mut app = App::load()?;
     if settings {
@@ -189,6 +193,17 @@ pub fn run(settings: bool) -> anyhow::Result<()> {
     let res = app.run(&mut term);
     leave()?;
     res
+}
+
+// started from a shortcut the terminal would close at once, hiding why:
+// the error stays on screen until Enter
+fn fail(e: &anyhow::Error) -> ! {
+    eprintln!("rbw tui: {e:#}");
+    if std::io::stdin().is_terminal() {
+        eprint!("\npress Enter to close ");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    std::process::exit(1);
 }
 
 fn enter() -> anyhow::Result<Term> {
