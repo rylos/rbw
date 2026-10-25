@@ -495,6 +495,40 @@ if command -v tmux >/dev/null; then
     for _ in 1 2; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done
     for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
     check "Esc quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
+
+    # typing: a fake Hyprland that logs where the focus goes, a fake dotool
+    # that logs what it types
+    mkdir -p "$WORK/typer"
+    cat >"$WORK/typer/hyprctl" <<EOF
+#!/bin/sh
+if [ "\$1" = clients ]; then
+    echo '[{"address":"0xaaa","focusHistoryID":0},{"address":"0xbbb","focusHistoryID":1}]'
+else
+    echo "\$*" >>"$WORK/focus.log"; echo ok
+fi
+EOF
+    printf '#!/bin/sh\ncat >>%s/typed.log\n' "$WORK" >"$WORK/typer/dotool"
+    chmod +x "$WORK/typer/hyprctl" "$WORK/typer/dotool"
+    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env PATH='$WORK/typer:$PATH' HYPRLAND_INSTANCE_SIGNATURE=fake RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    wait_screen "/$(rbw list | wc -l)\$" >/dev/null
+    tmux send-keys -t rbw-e2e 'flags'
+    wait_screen ' 1/' >/dev/null
+    tmux send-keys -t rbw-e2e Enter
+    check "Enter opens the actions" 0 "$(wait_screen 'type password  *Alt+P' ; echo $?)"
+    tmux send-keys -t rbw-e2e Escape
+    sleep 0.2
+    tmux send-keys -t rbw-e2e M-p
+    for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
+    check "Alt+P gives the focus back to the previous window" 1 "$(grep -c 0xbbb "$WORK/focus.log" 2>/dev/null)"
+    check "  types the password there" "type $(rbw get flags)" "$(cat "$WORK/typed.log" 2>/dev/null)"
+    check "  and quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
+    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env -u HYPRLAND_INSTANCE_SIGNATURE -u NIRI_SOCKET PATH='$WORK/typer:$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    wait_screen "/$(rbw list | wc -l)\$" >/dev/null
+    tmux send-keys -t rbw-e2e 'flags'
+    wait_screen ' 1/' >/dev/null
+    tmux send-keys -t rbw-e2e M-u
+    check "without Hyprland or niri it refuses to type" 0 "$(wait_screen 'typing needs Hyprland' ; echo $?)"
+    tmux kill-session -t rbw-e2e 2>/dev/null || true
 else
     echo "skipped (no tmux)"
 fi

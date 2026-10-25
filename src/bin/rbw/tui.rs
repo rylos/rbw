@@ -5,6 +5,9 @@
 // with master password reprompt, which wait for an explicit Enter. Copies go
 // through the agent, which clears the clipboard after CLIPBOARD_SECONDS.
 // The sidebar (views.rs) narrows the list like the official clients do.
+// Ctrl with a letter copies (P password, U username, T totp), Alt with the
+// same letter types it into the previous window instead (typer.rs) and quits,
+// like rofi-rbw. Enter opens a menu with these and the other actions.
 
 use std::io::IsTerminal as _;
 
@@ -59,9 +62,20 @@ enum Mode {
     // the selected row
     Settings(usize),
     New(NewForm),
+    // the actions on the selected entry (or field), with the selected row
+    Actions(usize),
     // the list of choices for the selected row of the new item popup
     Pick(NewForm, Picker),
     Generator,
+}
+
+// what a row of the actions menu does: the same as a key, or copying and
+// typing the selected field
+#[derive(Clone, Copy)]
+enum Act {
+    Key(KeyCode, KeyModifiers),
+    CopyField,
+    TypeField,
 }
 
 struct Picker {
@@ -152,6 +166,8 @@ struct App {
 enum Outcome {
     // a command that needs the real terminal (editor, pinentry)
     Suspend(Box<dyn FnOnce() -> anyhow::Result<String>>),
+    // (what, value): typed into the previous window, then the tui quits
+    Type(String, String),
     Reload,
     None,
 }
@@ -525,6 +541,20 @@ impl App {
         }
     }
 
+    fn type_value(&mut self, what: &str, value: Option<String>) -> Outcome {
+        match value {
+            Some(value) if !value.is_empty() => {
+                Outcome::Type(what.to_string(), value)
+            }
+            _ => {
+                let name = self.selected().map_or("", |e| e.name.as_str());
+                let msg = format!("{name} has no {what}");
+                self.message(msg, true);
+                Outcome::None
+            }
+        }
+    }
+
     // the details of the selection, decrypting them first when needed (an
     // entry with reprompt asks for the master password here)
     fn ensure_details(&mut self) -> Option<TuiDetails> {
@@ -544,6 +574,7 @@ impl App {
             Mode::Help => return Outcome::None,
             Mode::Settings(row) => return self.settings_key(key, row),
             Mode::New(form) => return self.new_key(key, form),
+            Mode::Actions(row) => return self.actions_key(key, row),
             Mode::Generator => return self.generator_key(key),
             Mode::Pick(form, picker) => {
                 return self.pick_key(key, form, picker)
@@ -584,7 +615,7 @@ impl App {
             match key.code {
                 KeyCode::Up => self.sidebar_move(-1),
                 KeyCode::Down => self.sidebar_move(1),
-                KeyCode::Char('p' | 'k') if ctrl => self.sidebar_move(-1),
+                KeyCode::Char('k') if ctrl => self.sidebar_move(-1),
                 KeyCode::Char('j') if ctrl => self.sidebar_move(1),
                 KeyCode::PageUp => self.sidebar_move(-10),
                 KeyCode::PageDown => self.sidebar_move(10),
@@ -607,6 +638,10 @@ impl App {
 
         if self.view == View::Trash && self.focus == Focus::List {
             match key.code {
+                KeyCode::Enter if alt => {
+                    self.message("restore it first (Enter)", true);
+                    return Outcome::None;
+                }
                 KeyCode::Enter => {
                     let Some(entry) = self.selected() else {
                         return Outcome::None;
@@ -635,6 +670,32 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('p') if alt => {
+                if let Some(details) = self.ensure_details() {
+                    let what = primary_label(self.selected().map(|e| e.kind));
+                    return self.type_value(what, details.primary);
+                }
+            }
+            KeyCode::Char('p') if ctrl => {
+                if let Some(details) = self.ensure_details() {
+                    let what = primary_label(self.selected().map(|e| e.kind));
+                    self.copy(what, details.primary);
+                }
+            }
+            KeyCode::Char('u') if alt => {
+                if let Some(details) = self.ensure_details() {
+                    return self.type_value("username", details.username);
+                }
+            }
+            KeyCode::Char('t') if alt => {
+                if let Some(details) = self.ensure_details() {
+                    let code = details
+                        .totp
+                        .and_then(|t| crate::commands::tui_totp(&t).ok())
+                        .map(|(code, _)| code);
+                    return self.type_value("totp code", code);
+                }
+            }
             KeyCode::Char('c' | 'q') if ctrl => self.quit = true,
             KeyCode::Esc => {
                 if self.focus == Focus::Details {
@@ -648,7 +709,7 @@ impl App {
             }
             KeyCode::Up => self.move_by(-1),
             KeyCode::Down => self.move_by(1),
-            KeyCode::Char('p' | 'k') if ctrl => self.move_by(-1),
+            KeyCode::Char('k') if ctrl => self.move_by(-1),
             KeyCode::Char('j') if ctrl => self.move_by(1),
             KeyCode::PageUp => self.move_by(-10),
             KeyCode::PageDown => self.move_by(10),
@@ -675,16 +736,10 @@ impl App {
                 self.focus = Focus::List;
             }
             KeyCode::Enter => {
-                if self.focus == Focus::Details {
-                    let lines = self.detail_lines();
-                    if let Some((label, value, _)) =
-                        lines.get(self.detail_line).cloned()
-                    {
-                        self.copy(&label, Some(value));
-                    }
-                } else if let Some(details) = self.ensure_details() {
-                    let what = primary_label(self.selected().map(|e| e.kind));
-                    self.copy(what, details.primary);
+                // the details first: an entry with reprompt asks for the
+                // master password here, not in the middle of the menu
+                if self.ensure_details().is_some() {
+                    self.mode = Mode::Actions(0);
                 }
             }
             KeyCode::Char('u') if ctrl => {
@@ -851,6 +906,23 @@ impl App {
             }
             match self.handle_key(key) {
                 Outcome::None => {}
+                Outcome::Type(what, value) => {
+                    let id = self.selected().map(|e| e.id.clone());
+                    match crate::typer::type_into_previous_window(&value) {
+                        Ok(()) => {
+                            if let Some(id) = id {
+                                rbw::usage::Usage::record(&id);
+                            }
+                            self.quit = true;
+                        }
+                        Err(e) => {
+                            self.message(
+                                format!("can't type the {what}: {e:#}"),
+                                true,
+                            );
+                        }
+                    }
+                }
                 Outcome::Reload => {
                     if let Err(e) = self.reload() {
                         self.message(format!("{e:#}"), true);
@@ -1242,6 +1314,149 @@ impl App {
         Outcome::None
     }
 
+    // (label, shortcut, action) of the actions menu
+    fn actions(&self) -> Vec<(String, &'static str, Act)> {
+        let none = KeyModifiers::NONE;
+        let (ctrl, alt) = (KeyModifiers::CONTROL, KeyModifiers::ALT);
+        if self.focus == Focus::Details {
+            let field = self
+                .detail_lines()
+                .get(self.detail_line)
+                .map_or_else(|| "field".to_string(), |(l, _, _)| l.clone());
+            return vec![
+                (format!("copy {field}"), "", Act::CopyField),
+                (format!("type {field}"), "", Act::TypeField),
+            ];
+        }
+        let main = primary_label(self.selected().map(|e| e.kind));
+        let details = self.selected().and_then(|e| self.details.get(&e.id));
+        let has_user = details.is_some_and(|d| d.username.is_some());
+        let has_totp = details.is_some_and(|d| d.totp.is_some());
+        let has_uri = self
+            .selected()
+            .is_some_and(|e| e.uris.iter().any(|u| u.contains("://")));
+        let mut rows = vec![
+            (
+                format!("copy {main}"),
+                "^P",
+                Act::Key(KeyCode::Char('p'), ctrl),
+            ),
+            (
+                format!("type {main}"),
+                "Alt+P",
+                Act::Key(KeyCode::Char('p'), alt),
+            ),
+        ];
+        if has_user {
+            rows.push((
+                "copy username".to_string(),
+                "^U",
+                Act::Key(KeyCode::Char('u'), ctrl),
+            ));
+            rows.push((
+                "type username".to_string(),
+                "Alt+U",
+                Act::Key(KeyCode::Char('u'), alt),
+            ));
+        }
+        if has_totp {
+            rows.push((
+                "copy totp code".to_string(),
+                "^T",
+                Act::Key(KeyCode::Char('t'), ctrl),
+            ));
+            rows.push((
+                "type totp code".to_string(),
+                "Alt+T",
+                Act::Key(KeyCode::Char('t'), alt),
+            ));
+        }
+        if has_uri {
+            rows.push((
+                "open the web address".to_string(),
+                "^O",
+                Act::Key(KeyCode::Char('o'), ctrl),
+            ));
+        }
+        rows.push((
+            "show the fields".to_string(),
+            "Tab",
+            Act::Key(KeyCode::Tab, none),
+        ));
+        rows.push((
+            "edit".to_string(),
+            "^E",
+            Act::Key(KeyCode::Char('e'), ctrl),
+        ));
+        let favorite = self.selected().is_some_and(|e| e.favorite);
+        rows.push((
+            if favorite {
+                "remove from the favorites"
+            } else {
+                "add to the favorites"
+            }
+            .to_string(),
+            "^F",
+            Act::Key(KeyCode::Char('f'), ctrl),
+        ));
+        let archived = self.selected().is_some_and(|e| e.archived);
+        rows.push((
+            if archived { "unarchive" } else { "archive" }.to_string(),
+            "^A",
+            Act::Key(KeyCode::Char('a'), ctrl),
+        ));
+        rows.push((
+            "move to the trash".to_string(),
+            "^D",
+            Act::Key(KeyCode::Char('d'), ctrl),
+        ));
+        rows
+    }
+
+    fn run_act(&mut self, act: Act) -> Outcome {
+        match act {
+            Act::Key(code, modifiers) => {
+                self.handle_key(KeyEvent::new(code, modifiers))
+            }
+            Act::CopyField | Act::TypeField => {
+                let lines = self.detail_lines();
+                let Some((label, value, _)) =
+                    lines.get(self.detail_line).cloned()
+                else {
+                    return Outcome::None;
+                };
+                if matches!(act, Act::TypeField) {
+                    self.type_value(&label, Some(value))
+                } else {
+                    self.copy(&label, Some(value));
+                    Outcome::None
+                }
+            }
+        }
+    }
+
+    fn actions_key(&mut self, key: KeyEvent, row: usize) -> Outcome {
+        let rows = self.actions();
+        match key.code {
+            KeyCode::Esc => Outcome::None,
+            KeyCode::Up => {
+                self.mode = Mode::Actions(row.saturating_sub(1));
+                Outcome::None
+            }
+            KeyCode::Down => {
+                self.mode = Mode::Actions(
+                    (row + 1).min(rows.len().saturating_sub(1)),
+                );
+                Outcome::None
+            }
+            KeyCode::Enter => rows
+                .get(row)
+                .map_or(Outcome::None, |(_, _, act)| self.run_act(*act)),
+            // a shortcut works here too, and closes the menu
+            _ => self.handle_key(key),
+        }
+    }
+
     fn settings_key(&mut self, key: KeyEvent, row: usize) -> Outcome {
         let step = match key.code {
             KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
@@ -1342,6 +1557,7 @@ impl App {
             Mode::Help => draw_help(f, area),
             Mode::Settings(row) => draw_settings(f, area, *row),
             Mode::New(form) => self.draw_new(f, area, form),
+            Mode::Actions(row) => self.draw_actions(f, area, *row),
             Mode::Generator => self.draw_generator(f, area),
             Mode::Pick(form, picker) => self.draw_pick(f, area, form, picker),
             Mode::ConfirmPurge(_) => {
@@ -1681,7 +1897,7 @@ impl App {
             || "field".to_string(),
             |(label, _, _)| label.clone(),
         );
-        let copy_field = format!("copy {field}");
+        let field_actions = format!("copy or type {field}");
         let copy_main = format!(
             "copy {}",
             primary_label(self.selected().map(|e| e.kind))
@@ -1690,7 +1906,7 @@ impl App {
             &[("↑↓", "view"), ("↵/→", "list"), ("F1", "help")]
         } else if self.focus == Focus::Details {
             &[
-                ("↵", &copy_field),
+                ("↵", &field_actions),
                 ("^R", "reveal"),
                 ("⇥/Esc", "back"),
                 ("F1", "help"),
@@ -1704,9 +1920,11 @@ impl App {
             ]
         } else {
             &[
-                ("↵", &copy_main),
+                ("↵", "actions"),
+                ("^P", &copy_main),
                 ("^U", "copy user"),
                 ("^T", "copy totp"),
+                ("Alt+P U T", "type"),
                 ("⇥", "fields"),
                 ("←", "views"),
                 ("^E", "edit"),
@@ -1900,6 +2118,43 @@ impl App {
         draw_popup(f, area, "Password generator", lines);
     }
 
+    fn draw_actions(&self, f: &mut ratatui::Frame, area: Rect, row: usize) {
+        let rows = self.actions();
+        let width = rows
+            .iter()
+            .map(|(l, _, _)| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut lines = vec![];
+        for (n, (label, key, _)) in rows.iter().enumerate() {
+            let selected = n == row;
+            let style = if selected {
+                Style::new().bg(Color::Indexed(236)).bold()
+            } else {
+                Style::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "▌" } else { " " },
+                    Style::new().fg(ACCENT),
+                ),
+                Span::styled(format!("{label:<width$}  "), style),
+                Span::styled((*key).to_string(), style.fg(ACCENT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            "↑↓".bold().fg(ACCENT),
+            " choose  ".fg(DIM),
+            "Enter".bold().fg(ACCENT),
+            " do it  ".fg(DIM),
+            "Esc".bold().fg(ACCENT),
+            " close".fg(DIM),
+        ]));
+        let title = self.selected().map_or("", |e| e.name.as_str());
+        draw_popup(f, area, title, lines);
+    }
+
     fn draw_pick(
         &self,
         f: &mut ratatui::Frame,
@@ -2029,9 +2284,11 @@ fn primary_label(kind: Option<&str>) -> &'static str {
 
 fn needs_secret(key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Enter | KeyCode::Tab | KeyCode::Right => true,
-        KeyCode::Char('u' | 't' | 'r' | 'e' | 'n' | 'd' | 'f' | 'a') => ctrl,
+        KeyCode::Char('p' | 'u' | 't') => ctrl || alt,
+        KeyCode::Char('r' | 'e' | 'n' | 'd' | 'f' | 'a') => ctrl,
         _ => false,
     }
 }
@@ -2163,10 +2420,15 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) {
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     let rows = [
         ("type", "filter (fuzzy; 'exact ^prefix suffix$ !not)"),
-        ("↑ ↓  ^P ^K / ^J", "move (PgUp PgDn Home End)"),
-        ("Enter", "copy password (card number, note, public key)"),
-        ("Tab →", "pick a field, Enter copies it"),
+        ("↑ ↓  ^K ^J", "move (PgUp PgDn Home End)"),
+        ("Enter", "actions on the entry (or the field)"),
+        ("^P", "copy password (card number, note, public key)"),
+        ("Tab →", "pick a field, Enter copies or types it"),
         ("^U  ^T", "copy username, totp code"),
+        (
+            "Alt+P Alt+U Alt+T",
+            "type them into the previous window, and quit",
+        ),
         ("^R", "show or hide secrets"),
         ("^O", "open the web address"),
         ("← ⇧Tab", "views: favorites, types, vaults, folders, trash"),

@@ -13,6 +13,7 @@ mod items;
 mod settings;
 mod sock;
 mod tui;
+mod typer;
 mod views;
 
 #[derive(Debug, clap::Args)]

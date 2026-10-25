@@ -57,6 +57,11 @@ Lock and unlock settings, mirroring the official "Security" page:
   with ssh-keygen, ed25519); Space opens a filterable list of the choices
   (folders, collections). ^F favorite, ^A archive, ^G generator (↑↓ row,
   ←→ value, like the other popups).
+- Ctrl+P/U/T copy password, username, totp; Alt+P/U/T type them into the
+  previous window and quit, like rofi-rbw (`typer.rs`: focus back with
+  Hyprland's focus history or niri's focus-window-previous, then dotool,
+  wtype, ydotool or xdotool, value on stdin). Enter opens a menu with every
+  action and its shortcut; on a field, copy or type that field.
 - sync now keeps favorite, archived, collection ids, organizations (name),
   collections and folders in the db (`src/api.rs` SyncData); the agent
   decrypts the keys of organizations joined while unlocked. CLI: `rbw add
@@ -68,7 +73,7 @@ Lock and unlock settings, mirroring the official "Security" page:
 - startup ≈ `rbw list` (≈ 40 ms on the real 1681-entry vault).
 
 ### Tests
-- `bash tests/vw/e2e.sh`: 139/139 (polkit faked; tui driven with tmux;
+- `bash tests/vw/e2e.sh`: 144/144 (polkit faked; tui driven with tmux;
   bwtool.py creates a test organization).
 - `tests/vw/dev-vault.sh`: throwaway vault on :8223 for trying the tui
   (`PATH=target/debug:$PATH RBW_PROFILE=rbwdev rbw tui`).
