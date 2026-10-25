@@ -100,7 +100,13 @@ Lock and unlock settings, mirroring the official "Security" page:
   without it the sandboxed helper can't open the camera ("not possible to
   open camera"), which is also why the official client's system unlock
   never used howdy.
-- pc-work: none of this yet (same three files; check howdy's camera there).
+- pc-work and nb-marco (2026-10-25 23:00): same package (`r43.gb9aefd6`)
+  and setup as pc-casa: polkit files (pc-work: howdy added above
+  pam_fprintd; nb-marco: contrib/polkit/polkit-1.pam), remember-password +
+  auto_unlock + tui_auth + lock_timeout never, rbw-unlock.service,
+  Hyprland SUPER+B → rbw tui and rofi-rbw on SUPER+SHIFT+P, TERMINAL=foot,
+  Noctalia plugin in the bar. TPM unlock checked with pinentry=/bin/false;
+  howdy in the polkit dialog and Alt+P typing still to try by hand.
 - Since 2026-10-25 21:00 pc-casa runs this branch on the real vault:
   `rbw-enhanced 1.15.0.r32.g30c786d-1`, built from a copy of the PKGBUILD
   in a temporary directory (`~/pkgbuilds` and AUR untouched). Old binaries
