@@ -56,6 +56,17 @@ Lock and unlock settings, mirroring the official "Security" page:
 - Real polkit + howdy tested on pc-casa with the dev vault: first unlock
   (saved password, TPM2) 3.7 s in a debug build, re-unlock 1.2 s.
 
+### Noctalia plugin (separate project)
+- `rylos/community-plugins`, branch `rbw`, directory `rbw/` (id `rylos/rbw`,
+  plugin_api 34 = Noctalia 5.3.0): service polling `rbw status --json`, bar
+  widget (lock glyph, right click lock/unlock), panel (open `rbw tui`,
+  unlock/lock, sync, `rbw tui --settings`, log in). README follows
+  README_TEMPLATE.md, only `translations/en.json` (repo rule). CI validator
+  passes except the missing `thumbnail.webp` (must be made with the
+  thumbnail generator from a screenshot).
+- Tested live on pc-casa against the dev vault: panel, unlock, sync, tui in
+  a terminal, bar glyph locked/unlocked.
+
 ## Machine setup done (pc-casa, 2026-10-25)
 - `/usr/share/polkit-1/actions/net.rbw.unlock.policy`
 - `/etc/pam.d/polkit-1` = contrib/polkit/polkit-1.pam (howdy on top;
@@ -67,6 +78,13 @@ Lock and unlock settings, mirroring the official "Security" page:
 - pc-work: none of this yet (same three files; check howdy's camera there).
 - The real vault still runs the `enhanced` package (rbw-enhanced): nothing
   of this branch is installed.
+- Noctalia: plugin copied to `~/.local/share/noctalia/plugins/rbw/`, enabled,
+  widget `rbw` added to the default bar after `bar_2`
+  (`~/.local/state/noctalia/settings.toml`, backup
+  `settings.toml.bak-20261025-rbw`). TEMPORARY: `[plugin_settings."rylos/rbw"]
+  rbw_bin` points to a wrapper in the session scratchpad (debug build,
+  `RBW_PROFILE=rbwdev`); remove it once this branch is installed, or the
+  widget shows an error after a reboot.
 
 ## Next
 1. Try it on the real vault: build a package from this branch, `rbw

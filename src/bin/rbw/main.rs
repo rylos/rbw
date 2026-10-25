@@ -270,7 +270,10 @@ enum Opt {
     Sync,
 
     #[command(about = "Search the vault interactively and copy values")]
-    Tui,
+    Tui {
+        #[arg(long, help = "Start on the security settings")]
+        settings: bool,
+    },
 
     #[command(
         about = "List all entries in the local Bitwarden database",
@@ -593,7 +596,7 @@ impl Opt {
             Self::RememberPassword { .. } => "remember-password".to_string(),
             Self::ForgetPassword => "forget-password".to_string(),
             Self::Sync => "sync".to_string(),
-            Self::Tui => "tui".to_string(),
+            Self::Tui { .. } => "tui".to_string(),
             Self::List { .. } => "list".to_string(),
             Self::Get { .. } => "get".to_string(),
             Self::Search { .. } => "search".to_string(),
@@ -697,7 +700,7 @@ fn main() {
         }
         Opt::ForgetPassword => commands::forget_password(),
         Opt::Sync => commands::sync(),
-        Opt::Tui => tui::run(),
+        Opt::Tui { settings } => tui::run(settings),
         Opt::List { fields, raw } => commands::list(&fields, raw),
         Opt::Get {
             find_args,

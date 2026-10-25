@@ -73,12 +73,15 @@ enum Outcome {
     None,
 }
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(settings: bool) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(anyhow::anyhow!("rbw tui needs a terminal"));
     }
     crate::commands::tui_ensure_unlocked()?;
     let mut app = App::load()?;
+    if settings {
+        app.mode = Mode::Settings(0);
+    }
 
     let mut term = enter()?;
     let res = app.run(&mut term);
