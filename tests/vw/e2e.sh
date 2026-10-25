@@ -474,15 +474,22 @@ if command -v tmux >/dev/null; then
     tmux send-keys -t rbw-e2e Left Home Enter
     tmux send-keys -t rbw-e2e C-g
     check "^G opens the generator" 0 "$(wait_screen '‹ 20 characters ›' ; echo $?)"
-    tmux send-keys -t rbw-e2e Left
-    check "  ← shortens it" 0 "$(wait_screen '‹ 19 characters ›' ; echo $?)"
+    tmux send-keys -t rbw-e2e Down Left
+    check "  ↓ ← shortens it" 0 "$(wait_screen '‹ 19 characters ›' ; echo $?)"
     tmux send-keys -t rbw-e2e Escape
     sleep 0.2
     tmux send-keys -t rbw-e2e 'tessera'
     tmux send-keys -t rbw-e2e C-n
     check "^N asks type and vault" 0 "$(wait_screen 'Vault       ‹ My vault ›' ; echo $?)"
-    tmux send-keys -t rbw-e2e Right Down Right Down Down Enter
+    tmux send-keys -t rbw-e2e Right Down Right Down Down Space
+    check "  Space lists the folders" 0 "$(wait_screen '╭ Folder ─' ; echo $?)"
+    tmux send-keys -t rbw-e2e 'prov'
+    check "  typing filters them" 0 "$(wait_screen '1/' ; echo $?)"
+    tmux send-keys -t rbw-e2e Enter
+    check "  Enter picks one" 0 "$(wait_screen 'Folder      ‹ Prove ›' ; echo $?)"
+    tmux send-keys -t rbw-e2e Enter
     check "  and creates it" 0 "$(wait_screen 'added' ; echo $?)"
+    check "  in the picked folder" Prove "$(rbw get --raw tessera | jq -r .folder)"
     check "  a card in the organization, named after the filter" \
         '{"type":3,"org":"Azienda","number":"4111111111111111"}' "$(item tessera '{type, org, number: .card.number}')"
     for _ in 1 2; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done

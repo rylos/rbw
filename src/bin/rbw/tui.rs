@@ -59,7 +59,15 @@ enum Mode {
     // the selected row
     Settings(usize),
     New(NewForm),
+    // the list of choices for the selected row of the new item popup
+    Pick(NewForm, Picker),
     Generator,
+}
+
+struct Picker {
+    filter: String,
+    // position among the filtered choices
+    selected: usize,
 }
 
 // the choices of a new item before the editor opens
@@ -76,6 +84,8 @@ struct NewForm {
 }
 
 struct Generator {
+    // 0 type, 1 length
+    row: usize,
     ty: usize,
     len: usize,
     words: usize,
@@ -85,6 +95,7 @@ struct Generator {
 impl Generator {
     fn new() -> Self {
         let mut g = Self {
+            row: 0,
             ty: 0,
             len: 20,
             words: 5,
@@ -534,6 +545,9 @@ impl App {
             Mode::Settings(row) => return self.settings_key(key, row),
             Mode::New(form) => return self.new_key(key, form),
             Mode::Generator => return self.generator_key(key),
+            Mode::Pick(form, picker) => {
+                return self.pick_key(key, form, picker)
+            }
             Mode::ConfirmPurge(id) => {
                 if matches!(key.code, KeyCode::Char('y' | 'Y')) {
                     return inline(self, move || {
@@ -973,7 +987,18 @@ impl App {
                 0
             }
             KeyCode::Left => -1,
-            KeyCode::Right | KeyCode::Char(' ') => 1,
+            KeyCode::Right => 1,
+            KeyCode::Char(' ') => {
+                let selected = Self::choice(&form);
+                self.mode = Mode::Pick(
+                    form,
+                    Picker {
+                        filter: String::new(),
+                        selected,
+                    },
+                );
+                return Outcome::None;
+            }
             _ => 0,
         };
         if step != 0 {
@@ -1007,6 +1032,117 @@ impl App {
             }
         }
         self.mode = Mode::New(form);
+        Outcome::None
+    }
+
+    // the choices of a row of the new item popup, in order
+    fn choices(&self, form: &NewForm) -> Vec<String> {
+        match form.row {
+            0 => crate::views::KINDS
+                .iter()
+                .map(|(_, label)| (*label).to_string())
+                .collect(),
+            1 => std::iter::once("My vault".to_string())
+                .chain(
+                    self.vault.organizations.iter().map(|(_, n)| n.clone()),
+                )
+                .collect(),
+            2 => self
+                .writable_collections(form.vault)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            _ => std::iter::once("none".to_string())
+                .chain(self.vault.folders.iter().map(|(_, n)| n.clone()))
+                .collect(),
+        }
+    }
+
+    const fn choice(form: &NewForm) -> usize {
+        match form.row {
+            0 => form.kind,
+            1 => form.vault,
+            2 => form.collection,
+            _ => form.folder,
+        }
+    }
+
+    fn set_choice(form: &mut NewForm, i: usize) {
+        match form.row {
+            0 => form.kind = i,
+            1 => {
+                if form.vault != i {
+                    form.collection = 0;
+                }
+                form.vault = i;
+            }
+            2 => form.collection = i,
+            _ => form.folder = i,
+        }
+    }
+
+    // (index among all the choices, label) of those matching the filter
+    fn picked(
+        &self,
+        form: &NewForm,
+        picker: &Picker,
+    ) -> Vec<(usize, String)> {
+        let filter = picker.filter.to_lowercase();
+        self.choices(form)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, c)| c.to_lowercase().contains(&filter))
+            .collect()
+    }
+
+    fn pick_key(
+        &mut self,
+        key: KeyEvent,
+        mut form: NewForm,
+        mut picker: Picker,
+    ) -> Outcome {
+        let n = self.picked(&form, &picker).len();
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::New(form);
+                return Outcome::None;
+            }
+            KeyCode::Enter => {
+                if let Some((i, _)) =
+                    self.picked(&form, &picker).get(picker.selected)
+                {
+                    Self::set_choice(&mut form, *i);
+                }
+                self.mode = Mode::New(form);
+                return Outcome::None;
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                picker.selected =
+                    (picker.selected + 1).min(n.saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                picker.selected = picker.selected.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                picker.selected =
+                    (picker.selected + 10).min(n.saturating_sub(1));
+            }
+            KeyCode::Backspace => {
+                picker.filter.pop();
+                picker.selected = 0;
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                picker.filter.push(c);
+                picker.selected = 0;
+            }
+            _ => {}
+        }
+        self.mode = Mode::Pick(form, picker);
         Outcome::None
     }
 
@@ -1079,27 +1215,31 @@ impl App {
                 }
                 return Outcome::None;
             }
-            KeyCode::Left | KeyCode::Char('-') => {
-                if g.diceware() {
-                    g.words = g.words.saturating_sub(1).max(3);
-                } else {
-                    g.len = g.len.saturating_sub(1).max(5);
+            KeyCode::Up | KeyCode::BackTab => g.row = 0,
+            KeyCode::Down | KeyCode::Tab => g.row = 1,
+            KeyCode::Left | KeyCode::Right => {
+                let more = key.code == KeyCode::Right;
+                let n = GENERATOR_TYPES.len();
+                match (g.row, g.diceware()) {
+                    (0, _) => {
+                        g.ty = if more {
+                            (g.ty + 1) % n
+                        } else {
+                            (g.ty + n - 1) % n
+                        }
+                    }
+                    (_, true) => {
+                        g.words =
+                            if more { g.words + 1 } else { g.words - 1 }
+                                .clamp(3, 20);
+                    }
+                    (_, false) => {
+                        g.len = if more { g.len + 1 } else { g.len - 1 }
+                            .clamp(5, 128);
+                    }
                 }
             }
-            KeyCode::Right | KeyCode::Char('+') => {
-                if g.diceware() {
-                    g.words = (g.words + 1).min(20);
-                } else {
-                    g.len = (g.len + 1).min(128);
-                }
-            }
-            KeyCode::Up => {
-                g.ty = (g.ty + GENERATOR_TYPES.len() - 1)
-                    % GENERATOR_TYPES.len();
-            }
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char(' ') => {
-                g.ty = (g.ty + 1) % GENERATOR_TYPES.len();
-            }
+            // r, Space and anything else: a new one with the same settings
             _ => {}
         }
         g.generate();
@@ -1208,6 +1348,7 @@ impl App {
             Mode::Settings(row) => draw_settings(f, area, *row),
             Mode::New(form) => self.draw_new(f, area, form),
             Mode::Generator => self.draw_generator(f, area),
+            Mode::Pick(form, picker) => self.draw_pick(f, area, form, picker),
             Mode::ConfirmPurge(_) => {
                 let name = self.selected().map_or("", |e| e.name.as_str());
                 draw_popup(
@@ -1709,8 +1850,10 @@ impl App {
         lines.push(Line::from(vec![
             "↑↓".bold().fg(ACCENT),
             " choose  ".fg(DIM),
-            "←→ Space".bold().fg(ACCENT),
+            "←→".bold().fg(ACCENT),
             " change  ".fg(DIM),
+            "Space".bold().fg(ACCENT),
+            " list  ".fg(DIM),
             "Enter".bold().fg(ACCENT),
             " create  ".fg(DIM),
             "Esc".bold().fg(ACCENT),
@@ -1732,29 +1875,14 @@ impl App {
                 Style::new().fg(Color::Green).bold(),
             )),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(format!("{:<12}", "Type"), Style::new().fg(DIM)),
-                Span::styled(
-                    format!("‹ {} ›", GENERATOR_TYPES[g.ty].1),
-                    Style::new().fg(ACCENT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<12}", "Length"),
-                    Style::new().fg(DIM),
-                ),
-                Span::styled(
-                    format!("‹ {length} {unit} ›"),
-                    Style::new().fg(ACCENT),
-                ),
-            ]),
+            choice_line("Type", GENERATOR_TYPES[g.ty].1, g.row == 0),
+            choice_line("Length", &format!("{length} {unit}"), g.row == 1),
             Line::from(""),
             Line::from(vec![
                 "↑↓".bold().fg(ACCENT),
-                " type  ".fg(DIM),
+                " choose  ".fg(DIM),
                 "←→".bold().fg(ACCENT),
-                " length  ".fg(DIM),
+                " change  ".fg(DIM),
                 "r".bold().fg(ACCENT),
                 " again  ".fg(DIM),
                 "Enter".bold().fg(ACCENT),
@@ -1765,6 +1893,85 @@ impl App {
         ];
         draw_popup(f, area, "Password generator", lines);
     }
+
+    fn draw_pick(
+        &self,
+        f: &mut ratatui::Frame,
+        area: Rect,
+        form: &NewForm,
+        picker: &Picker,
+    ) {
+        let title =
+            ["Type", "Vault", "Collection", "Folder"][form.row.min(3)];
+        let picked = self.picked(form, picker);
+        let current = Self::choice(form);
+        // enough rows to fill most of the screen, scrolled to the selection
+        let height = usize::from(area.height.saturating_sub(8)).clamp(3, 20);
+        let first = picker.selected.saturating_sub(height - 1);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
+            Span::raw(picker.filter.clone()),
+            Span::styled(
+                format!("  {}/{}", picked.len(), self.choices(form).len()),
+                Style::new().fg(DIM),
+            ),
+        ])];
+        for (n, (i, label)) in
+            picked.iter().enumerate().skip(first).take(height)
+        {
+            let selected = n == picker.selected;
+            let mut style = if selected {
+                Style::new().bg(Color::Indexed(236)).bold()
+            } else {
+                Style::new()
+            };
+            if *i == current {
+                style = style.fg(ACCENT);
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "▌" } else { " " },
+                    Style::new().fg(ACCENT),
+                ),
+                Span::styled(label.clone(), style),
+            ]));
+        }
+        if picked.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " no matches",
+                Style::new().fg(DIM),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            "type".bold().fg(ACCENT),
+            " filter  ".fg(DIM),
+            "↑↓".bold().fg(ACCENT),
+            " move  ".fg(DIM),
+            "Enter".bold().fg(ACCENT),
+            " choose  ".fg(DIM),
+            "Esc".bold().fg(ACCENT),
+            " back".fg(DIM),
+        ]));
+        draw_popup(f, area, title, lines);
+    }
+}
+
+// a "label  ‹ value ›" row of a popup, marked when selected
+fn choice_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    let style = if selected {
+        Style::new().bg(Color::Indexed(236)).bold()
+    } else {
+        Style::new()
+    };
+    Line::from(vec![
+        Span::styled(
+            if selected { "▌" } else { " " },
+            Style::new().fg(ACCENT),
+        ),
+        Span::styled(format!("{label:<12}"), style),
+        Span::styled(format!("‹ {value} ›"), style.fg(ACCENT)),
+    ])
 }
 
 // runs a quick server request without leaving the tui, then reloads

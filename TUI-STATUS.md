@@ -54,7 +54,9 @@ Lock and unlock settings, mirroring the official "Security" page:
 - ^N new item: type (login, card, identity, note, ssh key), vault,
   collection (organizations), folder, preselected from the view; then the
   editor (logins start with a generated password, ssh keys are generated
-  with ssh-keygen, ed25519). ^F favorite, ^A archive, ^G generator.
+  with ssh-keygen, ed25519); Space opens a filterable list of the choices
+  (folders, collections). ^F favorite, ^A archive, ^G generator (↑↓ row,
+  ←→ value, like the other popups).
 - sync now keeps favorite, archived, collection ids, organizations (name),
   collections and folders in the db (`src/api.rs` SyncData); the agent
   decrypts the keys of organizations joined while unlocked. CLI: `rbw add
@@ -66,7 +68,7 @@ Lock and unlock settings, mirroring the official "Security" page:
 - startup ≈ `rbw list` (≈ 40 ms on the real 1681-entry vault).
 
 ### Tests
-- `bash tests/vw/e2e.sh`: 135/135 (polkit faked; tui driven with tmux;
+- `bash tests/vw/e2e.sh`: 139/139 (polkit faked; tui driven with tmux;
   bwtool.py creates a test organization).
 - `tests/vw/dev-vault.sh`: throwaway vault on :8223 for trying the tui
   (`PATH=target/debug:$PATH RBW_PROFILE=rbwdev rbw tui`).
