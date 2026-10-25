@@ -1721,6 +1721,13 @@ struct StatusOutput {
     login_expired: bool,
     // unix time of the last successful sync
     last_sync: Option<u64>,
+    // for bars and panels: whose vault, and how it opens
+    email: Option<String>,
+    server: Option<String>,
+    // unlocks with the saved password, without asking
+    auto_unlock: bool,
+    // system authentication once per login session to open the tui
+    tui_auth: bool,
 }
 
 // cheap enough to be polled by a status bar: it never starts the agent,
@@ -1756,6 +1763,18 @@ pub fn status(json: bool) -> anyhow::Result<()> {
         pin,
         login_expired: agent.as_ref().is_some_and(|a| a.login_expired),
         last_sync,
+        email: config.as_ref().and_then(|c| c.email.clone()),
+        server: config.as_ref().map(|c| {
+            let url = c.base_url();
+            url::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(ToString::to_string))
+                .unwrap_or(url)
+        }),
+        auto_unlock: config
+            .as_ref()
+            .is_some_and(|c| c.auto_unlock && c.saved_password.is_some()),
+        tui_auth: config.as_ref().is_some_and(|c| c.tui_auth),
     };
 
     if json {
