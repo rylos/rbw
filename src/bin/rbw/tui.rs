@@ -683,12 +683,7 @@ impl App {
                         self.copy(&label, Some(value));
                     }
                 } else if let Some(details) = self.ensure_details() {
-                    let what = match self.selected().map(|e| e.kind) {
-                        Some("card") => "number",
-                        Some("note") => "notes",
-                        Some("ssh key") => "public key",
-                        _ => "password",
-                    };
+                    let what = primary_label(self.selected().map(|e| e.kind));
                     self.copy(what, details.primary);
                 }
             }
@@ -1681,11 +1676,21 @@ impl App {
                 return;
             }
         }
+        // Enter copies the selected field, or the main value of the entry
+        let field = self.detail_lines().get(self.detail_line).map_or_else(
+            || "field".to_string(),
+            |(label, _, _)| label.clone(),
+        );
+        let copy_field = format!("copy {field}");
+        let copy_main = format!(
+            "copy {}",
+            primary_label(self.selected().map(|e| e.kind))
+        );
         let keys: &[(&str, &str)] = if self.focus == Focus::Sidebar {
             &[("↑↓", "view"), ("↵/→", "list"), ("F1", "help")]
         } else if self.focus == Focus::Details {
             &[
-                ("↵", "copy"),
+                ("↵", &copy_field),
                 ("^R", "reveal"),
                 ("⇥/Esc", "back"),
                 ("F1", "help"),
@@ -1699,9 +1704,9 @@ impl App {
             ]
         } else {
             &[
-                ("↵", "copy"),
-                ("^U", "user"),
-                ("^T", "totp"),
+                ("↵", &copy_main),
+                ("^U", "copy user"),
+                ("^T", "copy totp"),
                 ("⇥", "fields"),
                 ("←", "views"),
                 ("^E", "edit"),
@@ -2009,6 +2014,16 @@ fn truncate(s: &str, width: usize) -> String {
 // "2026-10-25T21:31:51.123Z" -> "2026-10-25"
 fn day(date: &str) -> &str {
     date.get(..10).unwrap_or(date)
+}
+
+// what Enter copies from an entry of this kind
+fn primary_label(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("card") => "number",
+        Some("note") => "notes",
+        Some("ssh key") => "public key",
+        _ => "password",
+    }
 }
 
 fn needs_secret(key: &KeyEvent) -> bool {
