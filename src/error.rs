@@ -65,6 +65,9 @@ pub enum Error {
     #[error("incorrect api key")]
     IncorrectApiKey,
 
+    #[error("biometric unlock: {message}")]
+    Biometric { message: String },
+
     #[error("{message}")]
     IncorrectPassword { message: String },
 

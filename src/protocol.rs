@@ -20,7 +20,7 @@ pub const VERSION: u32 = {
 
 // the enhanced fork extends the protocol, so its agent must never be mixed
 // with an upstream client of the same version (or the other way around)
-const FORK_PROTOCOL: u32 = 1;
+const FORK_PROTOCOL: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Request {
@@ -186,7 +186,18 @@ pub enum Action {
     Register,
     Unlock,
     CheckLock,
-    Lock,
+    // with biometric unlock a lock keeps the keys in memory unless hard
+    Lock {
+        #[serde(default)]
+        hard: bool,
+    },
+    // what the agent is doing, without unlocking or prompting for anything
+    Status,
+    // ask for the master password and save it for biometric unlock
+    BiometricEnroll {
+        store: Option<crate::biometric::SecretStore>,
+    },
+    BiometricDisable,
     Sync,
     Decrypt {
         cipherstring: String,
@@ -265,4 +276,17 @@ pub enum Response {
     Version {
         version: u32,
     },
+    Status(Status),
+    BiometricEnroll {
+        store: crate::biometric::SecretStore,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct Status {
+    pub locked: bool,
+    // locked, but biometric unlock can reuse the keys
+    pub keys_in_memory: bool,
+    pub biometric: bool,
+    pub login_expired: bool,
 }

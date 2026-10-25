@@ -1280,6 +1280,14 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.notify = parse_bool(value)
                 .context("failed to parse value for notify")?;
         }
+        "biometric" => {
+            config.biometric = parse_bool(value)
+                .context("failed to parse value for biometric")?;
+        }
+        "sort_by_usage" => {
+            config.sort_by_usage = parse_bool(value)
+                .context("failed to parse value for sort_by_usage")?;
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1311,6 +1319,8 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
         "persistent_login" => config.persistent_login = false,
         "notify" => config.notify = rbw::config::default_notify(),
+        "biometric" => config.biometric = false,
+        "sort_by_usage" => config.sort_by_usage = false,
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1396,7 +1406,7 @@ pub fn list(fields: &[String], raw: bool) -> anyhow::Result<()> {
         batch_decrypt(&db.entries, |entry, decryptor| {
             decrypt_list_cipher(entry, &fields, decryptor)
         })?;
-    entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    sort_entries(&mut entries);
 
     print_entry_list(&entries, &fields, raw)?;
 
@@ -1425,9 +1435,10 @@ pub fn get(
         needle
     );
 
-    let (_, decrypted) =
+    let (entry, decrypted) =
         find_entry(&db, needle, user, folder, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+    rbw::usage::Usage::record(&entry.id);
     if list_fields {
         decrypted.display_fields_list();
     } else if raw {
@@ -1441,6 +1452,17 @@ pub fn get(
     }
 
     Ok(())
+}
+
+// by name, or with sort_by_usage the most used first
+fn sort_entries(entries: &mut [DecryptedListCipher]) {
+    entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    if rbw::config::Config::load().is_ok_and(|c| c.sort_by_usage) {
+        let usage = rbw::usage::Usage::load();
+        entries.sort_by(|a, b| {
+            usage.score(&b.id).total_cmp(&usage.score(&a.id))
+        });
+    }
 }
 
 fn print_entry_list(
@@ -1528,7 +1550,7 @@ pub fn search(
         .filter(|entry| entry.search_match(term, folder))
         .map(std::convert::Into::into)
         .collect();
-    entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    sort_entries(&mut entries);
 
     print_entry_list(&entries, &fields, raw)?;
 
@@ -1552,9 +1574,10 @@ pub fn code(
         needle
     );
 
-    let (_, decrypted) =
+    let (entry, decrypted) =
         find_entry(&db, needle, user, folder, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+    rbw::usage::Usage::record(&entry.id);
 
     if let DecryptedData::Login { totp, .. } = decrypted.data {
         if let Some(totp) = totp {
@@ -1626,11 +1649,153 @@ pub fn history(
     Ok(())
 }
 
-pub fn lock() -> anyhow::Result<()> {
+pub fn lock(hard: bool) -> anyhow::Result<()> {
     ensure_agent()?;
-    crate::actions::lock()?;
+    crate::actions::lock(hard)?;
 
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct StatusOutput {
+    agent: bool,
+    logged_in: bool,
+    locked: bool,
+    keys_in_memory: bool,
+    biometric: bool,
+    login_expired: bool,
+    // unix time of the last successful sync
+    last_sync: Option<u64>,
+}
+
+// cheap enough to be polled by a status bar: it never starts the agent,
+// never prompts and doesn't decrypt anything
+pub fn status(json: bool) -> anyhow::Result<()> {
+    let config = rbw::config::Config::load().ok();
+    let db_file = config.as_ref().and_then(|config| {
+        config
+            .email
+            .as_ref()
+            .map(|email| rbw::dirs::db_file(&config.server_name(), email))
+    });
+    let last_sync = db_file
+        .as_ref()
+        .and_then(|file| std::fs::metadata(file).ok())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let agent = crate::actions::status()?;
+    let biometric = agent.as_ref().map_or_else(
+        || config.as_ref().is_some_and(|config| config.biometric),
+        |agent| agent.biometric,
+    );
+    let out = StatusOutput {
+        agent: agent.is_some(),
+        logged_in: last_sync.is_some(),
+        locked: agent.as_ref().is_none_or(|agent| agent.locked),
+        keys_in_memory: agent.as_ref().is_some_and(|a| a.keys_in_memory),
+        biometric,
+        login_expired: agent.as_ref().is_some_and(|a| a.login_expired),
+        last_sync,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+    } else {
+        let state = if !out.logged_in {
+            "logged out"
+        } else if out.login_expired {
+            "login expired"
+        } else if !out.agent {
+            "agent not running"
+        } else if !out.locked {
+            "unlocked"
+        } else if out.keys_in_memory {
+            "locked (biometric unlock ready)"
+        } else {
+            "locked"
+        };
+        println!("{state}");
+    }
+
+    Ok(())
+}
+
+pub fn biometric_enroll(store: Option<&str>) -> anyhow::Result<()> {
+    let store = store
+        .map(str::parse::<rbw::biometric::SecretStore>)
+        .transpose()?;
+    if !block_on(rbw::biometric::polkit_available()) {
+        return Err(anyhow::anyhow!(
+            "the polkit action {} is not installed: copy \
+             contrib/polkit/net.rbw.unlock.policy to \
+             /usr/share/polkit-1/actions/ (as root)",
+            rbw::biometric::POLKIT_ACTION
+        ));
+    }
+    ensure_agent()?;
+    let store = crate::actions::biometric_enroll(store)?;
+
+    let mut config = rbw::config::Config::load()?;
+    config.biometric = true;
+    config.biometric_store = Some(store);
+    config.save()?;
+    println!("master password saved in {}", store.name());
+
+    Ok(())
+}
+
+pub fn biometric_disable() -> anyhow::Result<()> {
+    if crate::actions::status()?.is_some() {
+        crate::actions::biometric_disable()?;
+    } else if let Some(store) = rbw::config::Config::load()?.biometric_store {
+        block_on(rbw::biometric::forget(store))?;
+    }
+    let mut config = rbw::config::Config::load()?;
+    config.biometric = false;
+    config.biometric_store = None;
+    config.save()?;
+
+    Ok(())
+}
+
+pub fn biometric_status() -> anyhow::Result<()> {
+    let config = rbw::config::Config::load()?;
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    println!("enabled:        {}", yes_no(config.biometric));
+    println!(
+        "saved password: {}",
+        config
+            .biometric_store
+            .map_or("none (first unlock asks for it)", |s| s.name())
+    );
+    println!(
+        "polkit action:  {}",
+        if block_on(rbw::biometric::polkit_available()) {
+            "installed"
+        } else {
+            "missing (contrib/polkit/net.rbw.unlock.policy)"
+        }
+    );
+    println!(
+        "tpm2:           {}",
+        yes_no(block_on(rbw::biometric::has_tpm2()))
+    );
+    println!(
+        "default store:  {}",
+        block_on(rbw::biometric::default_store())
+            .map_or("none available", rbw::biometric::SecretStore::name)
+    );
+
+    Ok(())
+}
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
 }
 
 pub fn purge() -> anyhow::Result<()> {

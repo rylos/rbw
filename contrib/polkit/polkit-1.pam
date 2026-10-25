@@ -1,0 +1,11 @@
+#%PAM-1.0
+# /etc/pam.d/polkit-1: the polkit-1 stack of your distribution (Arch:
+# /usr/lib/pam.d/polkit-1) with a biometric module on top. Only the modules
+# for the hardware you have; each one falls through to the password when it
+# fails or times out.
+auth       sufficient   pam_howdy.so
+# auth     sufficient   pam_fprintd.so
+auth       include      system-auth
+account    include      system-auth
+password   include      system-auth
+session    include      system-auth

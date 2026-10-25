@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod api;
 pub mod base64;
+pub mod biometric;
 pub mod cipherstring;
 pub mod config;
 pub mod db;
@@ -14,4 +15,5 @@ pub mod pinentry;
 mod prelude;
 pub mod protocol;
 pub mod pwgen;
+pub mod usage;
 pub mod wordlist;

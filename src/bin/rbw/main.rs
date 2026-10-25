@@ -160,6 +160,35 @@ enum AttachmentCommand {
     },
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum BiometricCommand {
+    #[command(
+        about = "Save the master password so that unlocking only needs \
+            polkit (face, fingerprint or account password)",
+        long_about = "Save the master password so that unlocking only \
+            needs polkit (face, fingerprint or account password)\n\n\
+            The password is encrypted with systemd-creds (tied to this \
+            machine, with the TPM2 when there is one) or kept in the Secret \
+            Service. Any program running as you can read it back: \
+            biometrics protect against someone at the keyboard, not against \
+            malware. Needs the net.rbw.unlock polkit action (contrib/polkit)."
+    )]
+    Enroll {
+        #[arg(
+            long,
+            help = "Where to save it: systemd-creds or secret-service \
+                (default: systemd-creds when it works)"
+        )]
+        store: Option<String>,
+    },
+    #[command(
+        about = "Forget the saved master password and unlock with it again"
+    )]
+    Disable,
+    #[command(about = "Show what biometric unlock can use on this machine")]
+    Status,
+}
+
 #[derive(Debug, clap::Parser)]
 #[command(version, about = "Unofficial Bitwarden CLI")]
 enum Opt {
@@ -188,6 +217,20 @@ enum Opt {
 
     #[command(about = "Check if the local Bitwarden database is unlocked")]
     Unlocked,
+
+    #[command(
+        about = "Show the agent's state without starting it or prompting"
+    )]
+    Status {
+        #[arg(long, help = "Display output as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Set up unlocking with polkit (face, fingerprint)")]
+    Biometric {
+        #[command(subcommand)]
+        biometric: BiometricCommand,
+    },
 
     #[command(about = "Update the local copy of the Bitwarden database")]
     Sync,
@@ -471,8 +514,18 @@ enum Opt {
         find_args: FindArgs,
     },
 
-    #[command(about = "Lock the password database")]
-    Lock,
+    #[command(
+        about = "Lock the password database",
+        long_about = "Lock the password database\n\n\
+            With biometric unlock the agent keeps the keys in memory and \
+            stops using them until polkit authorizes an unlock; --hard \
+            drops them, so that the next unlock needs the master password \
+            (or the saved one)."
+    )]
+    Lock {
+        #[arg(long, help = "Drop the keys from memory")]
+        hard: bool,
+    },
 
     #[command(about = "Remove the local copy of the password database")]
     Purge,
@@ -497,6 +550,8 @@ impl Opt {
             Self::Login => "login".to_string(),
             Self::Unlock => "unlock".to_string(),
             Self::Unlocked => "unlocked".to_string(),
+            Self::Status { .. } => "status".to_string(),
+            Self::Biometric { .. } => "biometric".to_string(),
             Self::Sync => "sync".to_string(),
             Self::List { .. } => "list".to_string(),
             Self::Get { .. } => "get".to_string(),
@@ -513,7 +568,7 @@ impl Opt {
             Self::Folder { .. } => "folder".to_string(),
             Self::Attachment { .. } => "attachment".to_string(),
             Self::History { .. } => "history".to_string(),
-            Self::Lock => "lock".to_string(),
+            Self::Lock { .. } => "lock".to_string(),
             Self::Purge => "purge".to_string(),
             Self::StopAgent => "stop-agent".to_string(),
             Self::GenCompletions { .. } => "gen-completions".to_string(),
@@ -590,6 +645,14 @@ fn main() {
         Opt::Login => commands::login(),
         Opt::Unlock => commands::unlock(),
         Opt::Unlocked => commands::unlocked(),
+        Opt::Status { json } => commands::status(json),
+        Opt::Biometric { biometric } => match biometric {
+            BiometricCommand::Enroll { store } => {
+                commands::biometric_enroll(store.as_deref())
+            }
+            BiometricCommand::Disable => commands::biometric_disable(),
+            BiometricCommand::Status => commands::biometric_status(),
+        },
         Opt::Sync => commands::sync(),
         Opt::List { fields, raw } => commands::list(&fields, raw),
         Opt::Get {
@@ -802,7 +865,7 @@ fn main() {
             find_args.folder.as_deref(),
             find_args.ignorecase,
         ),
-        Opt::Lock => commands::lock(),
+        Opt::Lock { hard } => commands::lock(hard),
         Opt::Purge => commands::purge(),
         Opt::StopAgent => commands::stop_agent(),
         Opt::GenCompletions { shell } => {

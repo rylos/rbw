@@ -27,6 +27,7 @@ impl Agent {
         pub enum Event {
             Request(std::io::Result<tokio::net::UnixStream>),
             Timeout(()),
+            Logout(()),
             Sync(()),
         }
 
@@ -42,7 +43,7 @@ impl Agent {
                 notifications,
             )
             .map(|message| match message {
-                crate::notifications::Message::Logout => Event::Timeout(()),
+                crate::notifications::Message::Logout => Event::Logout(()),
                 crate::notifications::Message::Sync => Event::Sync(()),
             })
             .boxed();
@@ -93,6 +94,9 @@ impl Agent {
                 Event::Timeout(()) => {
                     self.state.lock().await.clear();
                 }
+                Event::Logout(()) => {
+                    self.state.lock().await.forget_keys();
+                }
                 Event::Sync(()) => {
                     let state = self.state.clone();
                     tokio::spawn(async move {
@@ -142,8 +146,26 @@ async fn handle_request(
             crate::actions::check_lock(sock, state.clone()).await?;
             false
         }
-        rbw::protocol::Action::Lock => {
-            crate::actions::lock(sock, state.clone()).await?;
+        rbw::protocol::Action::Lock { hard } => {
+            crate::actions::lock(sock, state.clone(), *hard).await?;
+            false
+        }
+        rbw::protocol::Action::Status => {
+            crate::actions::status(sock, state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::BiometricEnroll { store } => {
+            crate::actions::biometric_enroll(
+                sock,
+                state.clone(),
+                &environment,
+                *store,
+            )
+            .await?;
+            false
+        }
+        rbw::protocol::Action::BiometricDisable => {
+            crate::actions::biometric_disable(sock, state.clone()).await?;
             false
         }
         rbw::protocol::Action::Sync => {

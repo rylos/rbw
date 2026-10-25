@@ -48,8 +48,57 @@ pub fn sync() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Sync)
 }
 
-pub fn lock() -> anyhow::Result<()> {
-    simple_action(rbw::protocol::Action::Lock)
+pub fn lock(hard: bool) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::Lock { hard })
+}
+
+// None when the agent isn't running; never starts it
+pub fn status() -> anyhow::Result<Option<rbw::protocol::Status>> {
+    let mut sock = match crate::sock::Sock::connect() {
+        Ok(sock) => sock,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::Status,
+    ))?;
+    match sock.recv()? {
+        rbw::protocol::Response::Status(status) => Ok(Some(status)),
+        rbw::protocol::Response::Error { error } => {
+            Err(anyhow::anyhow!("{error}"))
+        }
+        res => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
+pub fn biometric_enroll(
+    store: Option<rbw::biometric::SecretStore>,
+) -> anyhow::Result<rbw::biometric::SecretStore> {
+    let mut sock = connect()?;
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::BiometricEnroll { store },
+    ))?;
+    match sock.recv()? {
+        rbw::protocol::Response::BiometricEnroll { store } => Ok(store),
+        rbw::protocol::Response::Error { error } => {
+            Err(anyhow::anyhow!("{error}"))
+        }
+        res => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
+pub fn biometric_disable() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::BiometricDisable)
 }
 
 pub fn quit() -> anyhow::Result<()> {

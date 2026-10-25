@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- install as /usr/share/polkit-1/actions/net.rbw.unlock.policy -->
+<policyconfig>
+  <vendor>rbw</vendor>
+  <vendor_url>https://github.com/rylos/rbw</vendor_url>
+  <action id="net.rbw.unlock">
+    <description>Unlock the rbw password database</description>
+    <message>Authenticate to unlock your Bitwarden vault</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- every unlock authenticates again: never auth_self_keep -->
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

@@ -8,6 +8,13 @@ impl Sock {
         Self(s)
     }
 
+    // the process on the other end, whose session's polkit agent should
+    // show the biometric unlock dialog
+    pub fn peer_pid(&self) -> Option<u32> {
+        let pid = self.0.peer_cred().ok()?.pid()?;
+        u32::try_from(pid).ok()
+    }
+
     pub async fn send(
         &mut self,
         res: &rbw::protocol::Response,

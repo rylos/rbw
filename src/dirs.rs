@@ -63,6 +63,14 @@ pub fn device_id_file() -> std::path::PathBuf {
     data_dir().join("device_id")
 }
 
+pub fn biometric_credential_file() -> std::path::PathBuf {
+    data_dir().join("biometric.cred")
+}
+
+pub fn usage_file() -> std::path::PathBuf {
+    data_dir().join("usage.json")
+}
+
 pub fn socket_file() -> std::path::PathBuf {
     runtime_dir().join("socket")
 }

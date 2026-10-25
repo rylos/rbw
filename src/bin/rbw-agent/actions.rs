@@ -102,7 +102,7 @@ pub async fn login(
         match res {
             Ok(_) => {
                 sync(None, state.clone()).await?;
-                unlock_state(state, environment).await?;
+                unlock_state(state, environment, sock.peer_pid()).await?;
                 respond_ack(sock).await?;
                 return Ok(());
             }
@@ -400,6 +400,7 @@ async fn login_success(
             let mut state = state.lock().await;
             state.priv_key = Some(keys);
             state.org_keys = Some(org_keys);
+            state.soft_locked = false;
         }
         Err(e) => return Err(e).context("failed to unlock database"),
     }
@@ -410,89 +411,166 @@ async fn login_success(
 async fn unlock_state(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
+    peer: Option<u32>,
 ) -> anyhow::Result<()> {
     let _unlock = UNLOCK.lock().await;
-    if state.lock().await.needs_unlock() {
-        let db = load_db().await?;
+    if !state.lock().await.needs_unlock() {
+        return Ok(());
+    }
 
-        let Some(kdf) = db.kdf else {
-            return Err(anyhow::anyhow!("failed to find kdf type in db"));
+    if state.lock().await.biometric {
+        match biometric_unlock(state.clone(), peer).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => log::warn!(
+                "biometric unlock failed, asking for the master password: \
+                 {e:#}"
+            ),
+        }
+    }
+
+    let db = load_db().await?;
+    let email = config_email().await?;
+
+    let mut err_msg = None;
+    for i in 1_u8..=3 {
+        let err = if i > 1 {
+            // this unwrap is safe because we only ever continue the loop
+            // if we have set err_msg
+            Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
+        } else {
+            None
         };
-
-        let Some(iterations) = db.iterations else {
-            return Err(anyhow::anyhow!(
-                "failed to find number of iterations in db"
-            ));
-        };
-
-        let memory = db.memory;
-        let parallelism = db.parallelism;
-
-        let Some(protected_key) = db.protected_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected key in db"
-            ));
-        };
-        let Some(protected_private_key) = db.protected_private_key else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected private key in db"
-            ));
-        };
-
-        let email = config_email().await?;
-
-        let mut err_msg = None;
-        for i in 1_u8..=3 {
-            let err = if i > 1 {
-                // this unwrap is safe because we only ever continue the loop
-                // if we have set err_msg
-                Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-            } else {
-                None
-            };
-            let password = rbw::pinentry::getpin(
-                &config_pinentry().await?,
-                "Master Password",
-                &format!(
-                    "Unlock the local database for '{}'",
-                    rbw::dirs::profile()
-                ),
-                err.as_deref(),
-                environment,
-                true,
-            )
-            .await
-            .context("failed to read password from pinentry")?;
-            match rbw::actions::unlock(
-                &email,
-                &password,
-                kdf,
-                iterations,
-                memory,
-                parallelism,
-                &protected_key,
-                &protected_private_key,
-                &db.protected_org_keys,
-            ) {
-                Ok((keys, org_keys)) => {
-                    unlock_success(state, keys, org_keys).await?;
-                    break;
-                }
-                Err(rbw::error::Error::IncorrectPassword { message }) => {
-                    if i == 3 {
-                        return Err(rbw::error::Error::IncorrectPassword {
-                            message,
-                        })
-                        .context("failed to unlock database");
-                    }
-                    err_msg = Some(message);
-                }
-                Err(e) => return Err(e).context("failed to unlock database"),
+        let password = rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "Master Password",
+            &format!(
+                "Unlock the local database for '{}'",
+                rbw::dirs::profile()
+            ),
+            err.as_deref(),
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read password from pinentry")?;
+        match unlock_keys(&db, &email, &password)? {
+            Ok((keys, org_keys)) => {
+                unlock_success(state, keys, org_keys).await?;
+                break;
             }
+            Err(rbw::error::Error::IncorrectPassword { message }) => {
+                if i == 3 {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed to unlock database");
+                }
+                err_msg = Some(message);
+            }
+            Err(e) => return Err(e).context("failed to unlock database"),
         }
     }
 
     Ok(())
+}
+
+// the outer error is a db without the data needed to unlock, the inner one
+// comes from the unlock itself (so that a wrong password can be retried)
+fn unlock_keys(
+    db: &rbw::db::Db,
+    email: &str,
+    password: &rbw::locked::Password,
+) -> anyhow::Result<
+    Result<
+        (
+            rbw::locked::Keys,
+            std::collections::HashMap<String, rbw::locked::Keys>,
+        ),
+        rbw::error::Error,
+    >,
+> {
+    let Some(kdf) = db.kdf else {
+        return Err(anyhow::anyhow!("failed to find kdf type in db"));
+    };
+    let Some(iterations) = db.iterations else {
+        return Err(anyhow::anyhow!(
+            "failed to find number of iterations in db"
+        ));
+    };
+    let Some(protected_key) = &db.protected_key else {
+        return Err(anyhow::anyhow!("failed to find protected key in db"));
+    };
+    let Some(protected_private_key) = &db.protected_private_key else {
+        return Err(anyhow::anyhow!(
+            "failed to find protected private key in db"
+        ));
+    };
+    Ok(rbw::actions::unlock(
+        email,
+        password,
+        kdf,
+        iterations,
+        db.memory,
+        db.parallelism,
+        protected_key,
+        protected_private_key,
+        &db.protected_org_keys,
+    ))
+}
+
+// Ok(false) when biometric unlock isn't possible or the user didn't
+// authorize it: the caller then asks for the master password
+async fn biometric_unlock(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    peer: Option<u32>,
+) -> anyhow::Result<bool> {
+    let kept_keys = state.lock().await.has_keys();
+    let store = rbw::config::Config::load_async().await?.biometric_store;
+    if !kept_keys && store.is_none() {
+        return Ok(false);
+    }
+    if !rbw::biometric::polkit_available().await {
+        return Err(anyhow::anyhow!(
+            "the polkit action {} is not installed",
+            rbw::biometric::POLKIT_ACTION
+        ));
+    }
+
+    let pid = peer.unwrap_or_else(std::process::id);
+    if !rbw::biometric::authorize(pid).await? {
+        log::info!("biometric unlock not authorized");
+        return Ok(false);
+    }
+
+    if kept_keys {
+        state.lock().await.soft_locked = false;
+        return Ok(true);
+    }
+
+    // checked above
+    let store = store.unwrap();
+    let Some(password) = rbw::biometric::load(store).await? else {
+        return Err(anyhow::anyhow!(
+            "no master password saved in {}, run `rbw biometric enroll`",
+            store.name()
+        ));
+    };
+    let db = load_db().await?;
+    let email = config_email().await?;
+    match unlock_keys(&db, &email, &password)? {
+        Ok((keys, org_keys)) => {
+            unlock_success(state, keys, org_keys).await?;
+            Ok(true)
+        }
+        Err(rbw::error::Error::IncorrectPassword { .. }) => {
+            Err(anyhow::anyhow!(
+                "the saved master password is wrong (changed?), run \
+                 `rbw biometric enroll` again"
+            ))
+        }
+        Err(e) => Err(e).context("failed to unlock database"),
+    }
 }
 
 pub async fn unlock(
@@ -500,7 +578,7 @@ pub async fn unlock(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    unlock_state(state, environment).await?;
+    unlock_state(state, environment, sock.peer_pid()).await?;
 
     respond_ack(sock).await?;
 
@@ -515,14 +593,129 @@ async fn unlock_success(
     let mut state = state.lock().await;
     state.priv_key = Some(keys);
     state.org_keys = Some(org_keys);
+    state.soft_locked = false;
     Ok(())
 }
 
 pub async fn lock(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    hard: bool,
 ) -> anyhow::Result<()> {
-    state.lock().await.clear();
+    if hard {
+        state.lock().await.forget_keys();
+    } else {
+        state.lock().await.clear();
+    }
+
+    respond_ack(sock).await?;
+
+    Ok(())
+}
+
+pub async fn status(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let status = {
+        let state = state.lock().await;
+        rbw::protocol::Status {
+            locked: state.needs_unlock(),
+            keys_in_memory: state.soft_locked && state.has_keys(),
+            biometric: state.biometric,
+            login_expired: state.login_expired_notified,
+        }
+    };
+    sock.send(&rbw::protocol::Response::Status(status)).await?;
+
+    Ok(())
+}
+
+pub async fn biometric_enroll(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    store: Option<rbw::biometric::SecretStore>,
+) -> anyhow::Result<()> {
+    let store = match store {
+        Some(store) => store,
+        None => rbw::biometric::default_store().await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "neither systemd-creds (systemd 256 or newer) nor \
+                 secret-tool is available to save the master password"
+            )
+        })?,
+    };
+
+    let db = load_db().await?;
+    let email = config_email().await?;
+    let mut err_msg: Option<String> = None;
+    let password = loop {
+        let password = rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "Master Password",
+            "Save the master password for biometric unlock",
+            err_msg.as_deref(),
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read password from pinentry")?;
+        match unlock_keys(&db, &email, &password)? {
+            Ok((keys, org_keys)) => {
+                unlock_success(state.clone(), keys, org_keys).await?;
+                break password;
+            }
+            Err(rbw::error::Error::IncorrectPassword { message }) => {
+                if err_msg.is_some() {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed to verify the master password");
+                }
+                err_msg = Some(message);
+            }
+            Err(e) => {
+                return Err(e).context("failed to verify the master password")
+            }
+        }
+    };
+
+    rbw::biometric::store(store, &password).await?;
+    // make sure it reads back before relying on it
+    let saved = rbw::biometric::load(store).await?;
+    if saved.as_ref().map(rbw::locked::Password::password)
+        != Some(password.password())
+    {
+        let _ = rbw::biometric::forget(store).await;
+        return Err(anyhow::anyhow!(
+            "the password saved in {} didn't read back",
+            store.name()
+        ));
+    }
+
+    state.lock().await.biometric = true;
+    sock.send(&rbw::protocol::Response::BiometricEnroll { store })
+        .await?;
+
+    Ok(())
+}
+
+pub async fn biometric_disable(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    if let Some(store) =
+        rbw::config::Config::load_async().await?.biometric_store
+    {
+        rbw::biometric::forget(store).await?;
+    }
+    let mut state = state.lock().await;
+    state.biometric = false;
+    if state.soft_locked {
+        state.forget_keys();
+    }
+    drop(state);
 
     respond_ack(sock).await?;
 
@@ -1276,7 +1469,7 @@ pub async fn get_ssh_public_keys(
         state.set_timeout();
         state.last_environment().clone()
     };
-    unlock_state(state.clone(), &environment).await?;
+    unlock_state(state.clone(), &environment, None).await?;
 
     let db = load_db().await?;
     let mut pubkeys = Vec::new();
@@ -1312,7 +1505,7 @@ pub async fn find_ssh_private_key(
         state.set_timeout();
         state.last_environment().clone()
     };
-    unlock_state(state.clone(), &environment).await?;
+    unlock_state(state.clone(), &environment, None).await?;
 
     let request_bytes = request_public_key.to_bytes();
 

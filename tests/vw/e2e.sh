@@ -222,6 +222,62 @@ setdb '.access_token="x.eyJzdWIiOiJ4In0.x"'
 RBW_TEST_APIKEY_ID=$ID RBW_TEST_APIKEY_SECRET=$SECRET rbw sync
 check "background sync logs in again after agent restart" pw-api "$(rbw get flags)"
 
+echo "== biometric unlock"
+# polkit is faked (the real one needs someone at the keyboard): pkcheck logs
+# each call and answers with the exit code in pk.answer. systemd-creds is the
+# real one when it supports user credentials.
+printf '#!/bin/sh\nexit 0\n' >"$WORK/bin/pkaction"
+printf '#!/bin/sh\necho "$*" >> %s/pkcheck.log\nexit "$(cat %s/pk.answer)"\n' "$WORK" "$WORK" >"$WORK/bin/pkcheck"
+chmod +x "$WORK/bin/pkaction" "$WORK/bin/pkcheck"
+echo 0 >"$WORK/pk.answer"
+rbw config set pinentry "$WORK/bin/pinentry-log"
+rbw unlock
+: >"$WORK/pinentry.log"
+rbw biometric enroll
+STORE=$(jq -r .biometric_store "$HOME/.config/rbw-rbwtest/config.json")
+check "enroll asks for the master password once" 1 "$(wc -l <"$WORK/pinentry.log")"
+check "enroll enables biometric unlock" true "$(jq .biometric "$HOME/.config/rbw-rbwtest/config.json")"
+rbw lock
+check "lock keeps the keys" '[true,true]' "$(rbw status --json | jq -c '[.locked, .keys_in_memory]')"
+check "a locked agent refuses to decrypt" 1 "$(echo '{"environment":null,"action":{"type":"Decrypt","cipherstring":"'"$(jq -r '.entries[0].name' "$(db)")"'","entry_key":null,"org_id":null}}' | SOCK="${XDG_RUNTIME_DIR:-/tmp}/rbw-rbwtest/socket" python3 -I -c '
+import socket,sys,os
+s=socket.socket(socket.AF_UNIX); s.connect(os.environ["SOCK"]); s.sendall(sys.stdin.buffer.read()+b"\n")
+print(1 if b"Error" in s.makefile("rb").readline() else 0)')"
+: >"$WORK/pinentry.log"; : >"$WORK/pkcheck.log"
+check "unlock with the kept keys" pw-api "$(rbw get flags)"
+check "  asked polkit once" 1 "$(wc -l <"$WORK/pkcheck.log")"
+check "  and no pinentry" 0 "$(wc -l <"$WORK/pinentry.log")"
+rbw lock --hard
+check "lock --hard drops the keys" false "$(rbw status --json | jq .keys_in_memory)"
+check "unlock with the saved password ($STORE)" pw-api "$(rbw get flags)"
+check "  still no pinentry" 0 "$(wc -l <"$WORK/pinentry.log")"
+rbw stop-agent
+check "first unlock after the agent starts is biometric" pw-api "$(rbw get flags)"
+check "  still no pinentry" 0 "$(wc -l <"$WORK/pinentry.log")"
+echo 1 >"$WORK/pk.answer"
+rbw lock
+check "polkit refused: falls back to the master password" pw-api "$(rbw get flags)"
+check "  with one pinentry" 1 "$(wc -l <"$WORK/pinentry.log")"
+echo 0 >"$WORK/pk.answer"
+rbw biometric disable
+check "disable forgets the password" '[false,null]' "$(jq -c '[.biometric, .biometric_store]' "$HOME/.config/rbw-rbwtest/config.json")"
+check "  and removes the credential" no "$([ -e "$HOME/.local/share/rbw-rbwtest/biometric.cred" ] && echo yes || echo no)"
+rbw lock
+check "without biometric, lock drops the keys" false "$(rbw status --json | jq .keys_in_memory)"
+rbw config set pinentry "$ROOT/tests/vw/pinentry-test"
+
+echo "== status and usage"
+rbw stop-agent
+check "status doesn't start the agent" '[false,true,true]' "$(rbw status --json | jq -c '[.agent, .logged_in, .locked]')"
+check "  really" 1 "$(rbw unlocked >/dev/null 2>&1; echo $?)"
+rm -f "$HOME/.local/share/rbw-rbwtest/usage.json"
+rbw config set sort_by_usage true
+rbw get nota >/dev/null; rbw get nota >/dev/null; rbw get flags >/dev/null
+check "list puts the most used first" "nota flags" "$(rbw list | head -2 | tr '\n' ' ' | sed 's/ $//')"
+check "usage keeps only ids" 0 "$(grep -c -E 'nota|flags' "$HOME/.local/share/rbw-rbwtest/usage.json")"
+rbw config set sort_by_usage false
+check "and alphabetical without it" "$(rbw list | sort | head -1)" "$(rbw list | head -1)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

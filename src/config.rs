@@ -28,6 +28,18 @@ pub struct Config {
     // vault because the login expired
     #[serde(default = "default_notify")]
     pub notify: bool,
+    // unlock through polkit (face, fingerprint or the account password, as
+    // the polkit-1 pam stack decides) instead of the master password; with
+    // it, locking keeps the keys in memory and only stops using them
+    #[serde(default)]
+    pub biometric: bool,
+    // where `rbw biometric enroll` saved the master password, so that the
+    // first unlock after the agent starts can be biometric too
+    #[serde(default)]
+    pub biometric_store: Option<crate::biometric::SecretStore>,
+    // list the entries used most often and most recently first
+    #[serde(default)]
+    pub sort_by_usage: bool,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
     pub device_id: Option<String>,
@@ -48,6 +60,9 @@ impl Default for Config {
             client_cert_path: None,
             persistent_login: false,
             notify: default_notify(),
+            biometric: false,
+            biometric_store: None,
+            sort_by_usage: false,
             device_id: None,
         }
     }

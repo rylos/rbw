@@ -44,6 +44,8 @@ async fn tokio_main(
             last_environment: rbw::protocol::Environment::from_process(),
             api_key: None,
             login_expired_notified: false,
+            biometric: config.biometric,
+            soft_locked: false,
             #[cfg(feature = "clipboard")]
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|e| {

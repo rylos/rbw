@@ -29,28 +29,52 @@ pub struct State {
     pub api_key: Option<rbw::locked::ApiKey>,
     pub login_expired_notified: bool,
 
+    // with biometric unlock, locking keeps the keys but stops using them
+    // until polkit authorizes an unlock
+    pub biometric: bool,
+    pub soft_locked: bool,
+
     #[cfg(feature = "clipboard")]
     pub clipboard: Option<arboard::Clipboard>,
 }
 
 impl State {
     pub fn key(&self, org_id: Option<&str>) -> Option<&rbw::locked::Keys> {
+        if self.soft_locked {
+            return None;
+        }
         org_id.map_or(self.priv_key.as_ref(), |id| {
             self.org_keys.as_ref().and_then(|h| h.get(id))
         })
     }
 
     pub fn needs_unlock(&self) -> bool {
-        self.priv_key.is_none() || self.org_keys.is_none()
+        self.soft_locked || !self.has_keys()
+    }
+
+    pub fn has_keys(&self) -> bool {
+        self.priv_key.is_some() && self.org_keys.is_some()
     }
 
     pub fn set_timeout(&self) {
         self.timeout.set(self.timeout_duration);
     }
 
+    // lock: with biometric unlock the keys stay in memory, so that the next
+    // unlock only needs polkit
     pub fn clear(&mut self) {
+        if self.biometric && self.has_keys() {
+            self.soft_locked = true;
+            self.timeout.clear();
+        } else {
+            self.forget_keys();
+        }
+    }
+
+    pub fn forget_keys(&mut self) {
         self.priv_key = None;
         self.org_keys = None;
+        self.soft_locked = false;
         self.timeout.clear();
     }
 
