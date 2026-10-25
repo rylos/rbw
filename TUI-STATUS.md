@@ -89,7 +89,9 @@ Lock and unlock settings, mirroring the official "Security" page:
 ## Next
 1. Try it on the real vault: build a package from this branch, `rbw
    stop-agent`, check rofi-rbw, then pick the settings (F2).
-2. Noctalia plugin in rylos/community-plugins (separate project: only uses
-   `rbw status --json` and plain `rbw` commands).
+2. Noctalia plugin: make `thumbnail.webp` with the generator, then a PR to
+   noctalia-dev/community-plugins (PR template: tested compositors, version,
+   accounting of every spawned process). Only after this branch is
+   released, since the plugin needs `rbw status --json`.
 3. README of the fork: document the new commands when merging.
 4. Maybe: browser extension via native messaging to the agent.
