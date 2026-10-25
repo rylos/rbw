@@ -57,7 +57,8 @@ Lock and unlock settings, mirroring the official "Security" page:
   (saved password, TPM2) 3.7 s in a debug build, re-unlock 1.2 s.
 
 ### Noctalia plugin (separate project)
-- `rylos/community-plugins`, branch `rbw`, directory `rbw/` (id `rylos/rbw`,
+- `rylos/community-plugins`, branch `rbw`, directory `rbw-enhanced/` (id
+  `rylos/rbw-enhanced`, renamed from `rylos/rbw`: it only works with rbw-enhanced;
   plugin_api 34 = Noctalia 5.3.0): service polling `rbw status --json`, bar
   widget (lock glyph, right click lock/unlock), panel (open `rbw tui`,
   unlock/lock, sync, `rbw tui --settings`, log in). README follows
@@ -76,15 +77,16 @@ Lock and unlock settings, mirroring the official "Security" page:
   open camera"), which is also why the official client's system unlock
   never used howdy.
 - pc-work: none of this yet (same three files; check howdy's camera there).
-- The real vault still runs the `enhanced` package (rbw-enhanced): nothing
-  of this branch is installed.
+- Since 2026-10-25 21:00 pc-casa runs this branch on the real vault:
+  `rbw-enhanced 1.15.0.r32.g30c786d-1`, built from a copy of the PKGBUILD
+  in a temporary directory (`~/pkgbuilds` and AUR untouched). Old binaries
+  in `~/.local/share/rbw-rollback/`. `list --raw` and 40 `get --raw`
+  identical to before (rofi-rbw). Settings unchanged so far: Marco picks
+  them (F2).
 - Noctalia: plugin copied to `~/.local/share/noctalia/plugins/rbw/`, enabled,
-  widget `rbw` added to the default bar after `bar_2`
+  widget `rbw` (type `rylos/rbw-enhanced:bar`) added to the default bar after `bar_2`
   (`~/.local/state/noctalia/settings.toml`, backup
-  `settings.toml.bak-20261025-rbw`). TEMPORARY: `[plugin_settings."rylos/rbw"]
-  rbw_bin` points to a wrapper in the session scratchpad (debug build,
-  `RBW_PROFILE=rbwdev`); remove it once this branch is installed, or the
-  widget shows an error after a reboot.
+  `settings.toml.bak-20261025-rbw`). The temporary `rbw_bin` wrapper is gone: the plugin uses the installed rbw.
 
 ## Next
 1. Try it on the real vault: build a package from this branch, `rbw
