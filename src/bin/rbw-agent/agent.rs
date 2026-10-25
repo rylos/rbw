@@ -181,6 +181,10 @@ async fn handle_request(
             crate::actions::reload_config(sock, state.clone()).await?;
             false
         }
+        rbw::protocol::Action::AuthorizeTui => {
+            crate::actions::authorize_tui(sock, state.clone()).await?;
+            false
+        }
         rbw::protocol::Action::Sync => {
             crate::actions::sync(Some(sock), state.clone()).await?;
             false

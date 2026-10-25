@@ -48,6 +48,7 @@ async fn tokio_main(
             settings: crate::state::Settings::from_config(&config),
             soft_locked: false,
             pin_failures: 0,
+            tui_session: None,
             #[cfg(feature = "clipboard")]
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|e| {

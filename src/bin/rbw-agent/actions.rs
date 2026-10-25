@@ -421,6 +421,12 @@ async fn unlock_state(
     let settings = state.lock().await.settings;
     let reusable =
         state.lock().await.has_keys() || settings.saved_password.is_some();
+    if settings.auto_unlock && settings.saved_password.is_some() {
+        match reuse_keys(state.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => log::warn!("auto unlock failed: {e:#}"),
+        }
+    }
     if reusable && settings.system_auth {
         match system_unlock(state.clone(), peer).await {
             Ok(true) => return Ok(()),
@@ -843,6 +849,43 @@ pub async fn pin_clear(
     respond_ack(sock).await?;
 
     Ok(())
+}
+
+// the login session of a process (logind's session id, as the kernel keeps
+// it for audit); None outside a session
+fn session_of(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/sessionid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&id| id != u32::MAX)
+}
+
+// tui_auth: polkit once per login session. A convenience gate for the tui,
+// not a security boundary: with the vault unlocked, rbw get works anyway.
+pub async fn authorize_tui(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let Some(pid) = sock.peer_pid() else {
+        return Err(anyhow::anyhow!("couldn't identify the tui process"));
+    };
+    let session = session_of(pid);
+    if session.is_some() && state.lock().await.tui_session == session {
+        return respond_ack(sock).await;
+    }
+    if !rbw::biometric::polkit_available().await {
+        return Err(anyhow::anyhow!(
+            "the polkit action {} is not installed",
+            rbw::biometric::POLKIT_ACTION
+        ));
+    }
+    if !rbw::biometric::authorize(pid).await? {
+        return Err(anyhow::anyhow!("not authorized"));
+    }
+    state.lock().await.tui_session = session;
+    respond_ack(sock).await
 }
 
 pub async fn reload_config(

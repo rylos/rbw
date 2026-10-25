@@ -48,6 +48,13 @@ pub struct Config {
     // starts
     #[serde(default, alias = "biometric_store")]
     pub saved_password: Option<crate::biometric::SecretStore>,
+    // unlock with the saved password without asking anything: the vault is
+    // unlocked as soon as something (e.g. a login service) asks for it
+    #[serde(default)]
+    pub auto_unlock: bool,
+    // rbw tui asks polkit (face, fingerprint) once per login session
+    #[serde(default)]
+    pub tui_auth: bool,
     // list the entries used most often and most recently first
     #[serde(default)]
     pub sort_by_usage: bool,
@@ -76,6 +83,8 @@ impl Default for Config {
             timeout_action: TimeoutAction::default(),
             system_auth: false,
             saved_password: None,
+            auto_unlock: false,
+            tui_auth: false,
             sort_by_usage: false,
             device_id: None,
         }

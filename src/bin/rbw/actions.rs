@@ -113,6 +113,10 @@ pub fn reload_config() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::ReloadConfig)
 }
 
+pub fn authorize_tui() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::AuthorizeTui)
+}
+
 pub fn quit() -> anyhow::Result<()> {
     match crate::sock::Sock::connect() {
         Ok(mut sock) => {

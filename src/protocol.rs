@@ -205,6 +205,8 @@ pub enum Action {
     PinClear,
     // apply changed lock settings without restarting the agent
     ReloadConfig,
+    // tui_auth: ask polkit, unless the caller's login session already passed
+    AuthorizeTui,
     Sync,
     Decrypt {
         cipherstring: String,

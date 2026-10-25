@@ -26,7 +26,7 @@ const TIMEOUTS: &[Timeout] = &[
     Timeout::Restart,
 ];
 
-pub const ROWS: usize = 5;
+pub const ROWS: usize = 7;
 
 pub struct Settings {
     pub timeout: Timeout,
@@ -35,6 +35,8 @@ pub struct Settings {
     pub pin: bool,
     pub system_auth: bool,
     pub saved_password: bool,
+    pub auto_unlock: bool,
+    pub tui_auth: bool,
 }
 
 impl Settings {
@@ -61,6 +63,8 @@ impl Settings {
             pin: rbw::pin::is_set(),
             system_auth: config.system_auth,
             saved_password: config.saved_password.is_some(),
+            auto_unlock: config.auto_unlock,
+            tui_auth: config.tui_auth,
         }
     }
 
@@ -102,9 +106,17 @@ impl Settings {
                 "unlock through polkit: face (howdy), fingerprint, or your \
                   account password"
             }
-            _ => {
+            4 => {
                 "unchecked: the master password is saved (systemd-creds \
                   or keyring) so pin and system unlock work after a restart"
+            }
+            5 => {
+                "unlock with the saved password without asking: the vault \
+                  is open from the desktop login (rofi, scripts)"
+            }
+            _ => {
+                "rbw tui asks polkit (face, fingerprint) once per login \
+                  session; rbw get and rofi are not affected"
             }
         }
     }
@@ -177,7 +189,7 @@ pub fn change(settings: &Settings, row: usize, step: isize) -> Change {
             )
             .map(|()| "system authentication saved".to_string()),
         ),
-        _ => {
+        4 => {
             if settings.saved_password {
                 Change::Done(
                     crate::commands::forget_password().map(|()| {
@@ -191,5 +203,30 @@ pub fn change(settings: &Settings, row: usize, step: isize) -> Change {
                 }))
             }
         }
+        5 => {
+            if settings.auto_unlock {
+                Change::Done(
+                    set("auto_unlock", "false")
+                        .map(|()| "automatic unlock off".to_string()),
+                )
+            } else if settings.saved_password {
+                Change::Done(
+                    set("auto_unlock", "true")
+                        .map(|()| "automatic unlock on".to_string()),
+                )
+            } else {
+                // it needs the saved password: save it first
+                Change::Prompt(Box::new(|| {
+                    crate::commands::remember_password(None)?;
+                    set("auto_unlock", "true")?;
+                    Ok("master password saved, automatic unlock on"
+                        .to_string())
+                }))
+            }
+        }
+        _ => Change::Done(
+            set("tui_auth", if settings.tui_auth { "false" } else { "true" })
+                .map(|()| "tui authentication saved".to_string()),
+        ),
     }
 }

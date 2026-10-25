@@ -78,6 +78,9 @@ pub fn run(settings: bool) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("rbw tui needs a terminal"));
     }
     crate::commands::tui_ensure_unlocked()?;
+    if rbw::config::Config::load().is_ok_and(|c| c.tui_auth) {
+        crate::actions::authorize_tui()?;
+    }
     let mut app = App::load()?;
     if settings {
         app.mode = Mode::Settings(0);
@@ -296,7 +299,7 @@ impl App {
             }
         }
         if let Some(notes) = &details.notes {
-            lines.push(("notes".to_string(), notes.clone(), false));
+            lines.push(("notes".to_string(), notes.clone(), true));
         }
         lines
     }
@@ -849,10 +852,22 @@ impl App {
                         Span::styled("notes", Style::new().fg(DIM))
                             .style(style),
                     ));
-                    for l in value.lines() {
+                    // notes often hold keys and recovery codes: hidden
+                    // like the other secrets until ^R
+                    if self.reveal {
+                        for l in value.lines() {
+                            lines.push(Line::from(Span::styled(
+                                l.to_string(),
+                                style,
+                            )));
+                        }
+                    } else {
                         lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            style,
+                            format!(
+                                "•••• {} line(s), ^R shows them",
+                                value.lines().count()
+                            ),
+                            style.fg(DIM),
                         )));
                     }
                 } else {
@@ -1049,6 +1064,22 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) {
             ),
             String::new(),
             quick,
+        ),
+        (
+            format!(
+                "{} Unlock automatically (saved password)",
+                check(settings.auto_unlock)
+            ),
+            String::new(),
+            true,
+        ),
+        (
+            format!(
+                "{} Ask system authentication to open rbw tui",
+                check(settings.tui_auth)
+            ),
+            String::new(),
+            true,
         ),
     ];
     let mut lines = vec![];

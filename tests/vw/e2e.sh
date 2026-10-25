@@ -290,6 +290,35 @@ check "  one pinentry" 1 "$(prompts)"
 echo 0 >"$WORK/pk.answer"
 
 rbw config set system_auth false
+rbw config set auto_unlock true
+rbw lock --hard
+reset_logs
+check "auto_unlock: unlocks with the saved password" pw-api "$(rbw get flags)"
+check "  no pinentry, no polkit" "0 0" "$(prompts) $(pkchecks)"
+rbw stop-agent
+check "auto_unlock right after the agent starts" pw-api "$(rbw get flags)"
+check "  no pinentry, no polkit" "0 0" "$(prompts) $(pkchecks)"
+if command -v tmux >/dev/null; then
+    rbw config set tui_auth true
+    tui_once() {
+        tmux kill-session -t rbw-auth 2>/dev/null || true
+        tmux new-session -d -s rbw-auth -x 100 -y 20 "env PATH='$PATH' RBW_PROFILE=rbwtest rbw tui; sleep 5"
+        for _ in $(seq 1 50); do tmux capture-pane -p -t rbw-auth | grep -q -E '❯|not authorized' && break; sleep 0.1; done
+        tmux capture-pane -p -t rbw-auth | grep -c '❯'
+        tmux kill-session -t rbw-auth 2>/dev/null || true
+    }
+    reset_logs
+    check "tui_auth: the tui asks polkit" "1 1" "$(tui_once) $(pkchecks)"
+    check "  once per login session" "1 1" "$(tui_once) $(pkchecks)"
+    rbw stop-agent
+    echo 1 >"$WORK/pk.answer"
+    reset_logs
+    check "  refused: the tui doesn't open" 0 "$(tui_once)"
+    check "  but rbw get still works" pw-api "$(rbw get flags)"
+    echo 0 >"$WORK/pk.answer"
+    rbw config set tui_auth false
+fi
+rbw config set auto_unlock false
 reset_logs
 rbw pin set
 check "pin set asks twice" 2 "$(prompts)"

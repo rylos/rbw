@@ -1286,6 +1286,22 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             }
             config.system_auth = on;
         }
+        "auto_unlock" => {
+            config.auto_unlock = parse_bool(value)
+                .context("failed to parse value for auto_unlock")?;
+        }
+        "tui_auth" => {
+            let on = parse_bool(value)
+                .context("failed to parse value for tui_auth")?;
+            if on && !block_on(rbw::biometric::polkit_available()) {
+                return Err(anyhow::anyhow!(
+                    "the polkit action {} is not installed: see \
+                     contrib/polkit/README.md",
+                    rbw::biometric::POLKIT_ACTION
+                ));
+            }
+            config.tui_auth = on;
+        }
         "lock_on_sleep" => {
             config.lock_on_sleep = parse_bool(value)
                 .context("failed to parse value for lock_on_sleep")?;
@@ -1326,6 +1342,8 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         "persistent_login" => config.persistent_login = false,
         "notify" => config.notify = rbw::config::default_notify(),
         "system_auth" => config.system_auth = false,
+        "auto_unlock" => config.auto_unlock = false,
+        "tui_auth" => config.tui_auth = false,
         "lock_on_sleep" => config.lock_on_sleep = false,
         "lock_on_idle" => config.lock_on_idle = false,
         "timeout_action" => {
@@ -1346,6 +1364,8 @@ const LIVE_KEYS: &[&str] = &[
     "lock_on_idle",
     "timeout_action",
     "system_auth",
+    "auto_unlock",
+    "tui_auth",
     "sort_by_usage",
     "notify",
 ];
@@ -1831,6 +1851,15 @@ pub fn security() -> anyhow::Result<()> {
     );
     println!("pin               {}", yes_no(rbw::pin::is_set()));
     println!("system_auth       {}", yes_no(config.system_auth));
+    println!(
+        "auto_unlock       {}",
+        if config.auto_unlock && config.saved_password.is_none() {
+            "yes, but no saved password (run rbw remember-password)"
+        } else {
+            yes_no(config.auto_unlock)
+        }
+    );
+    println!("tui_auth          {}", yes_no(config.tui_auth));
     println!(
         "saved password    {}",
         config.saved_password.map_or(

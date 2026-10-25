@@ -36,6 +36,8 @@ pub struct State {
     // them until one of those unlocks
     pub soft_locked: bool,
     pub pin_failures: u8,
+    // the login session whose rbw tui passed the tui_auth check
+    pub tui_session: Option<u32>,
 
     #[cfg(feature = "clipboard")]
     pub clipboard: Option<arboard::Clipboard>,
@@ -46,6 +48,7 @@ pub struct Settings {
     pub system_auth: bool,
     pub pin: bool,
     pub saved_password: Option<rbw::biometric::SecretStore>,
+    pub auto_unlock: bool,
     pub timeout_action: rbw::config::TimeoutAction,
     pub lock_on_sleep: bool,
     pub lock_on_idle: bool,
@@ -57,6 +60,7 @@ impl Settings {
             system_auth: config.system_auth,
             pin: rbw::pin::is_set(),
             saved_password: config.saved_password,
+            auto_unlock: config.auto_unlock,
             timeout_action: config.timeout_action,
             lock_on_sleep: config.lock_on_sleep,
             lock_on_idle: config.lock_on_idle,
