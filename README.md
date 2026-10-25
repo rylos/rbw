@@ -1,302 +1,140 @@
-# rbw (enhanced fork)
+# rbw-enhanced
 
-This is the `enhanced` branch of [rylos/rbw](https://github.com/rylos/rbw), a
-fork of [doy/rbw](https://github.com/doy/rbw) 1.15.0. It adds full write
-support, attachments and an optional login that never expires, and merges a
-few pending upstream pull requests. Read-only output (`rbw list --raw`,
-`rbw get --raw`, ...) is unchanged apart from an extra `attachments` key, so
-tools built on it, like [rofi-rbw](https://github.com/fdw/rofi-rbw), keep
-working. Tested against Vaultwarden 1.37.4: `tests/vw/e2e.sh` runs every new
-command against a throwaway Vaultwarden in docker and checks each write with
-an independent decryptor.
+An unofficial [Bitwarden](https://bitwarden.com/) client for Linux: a fast
+terminal UI, full read and write access to the vault, and unlocking with
+your face, fingerprint, a PIN or the TPM. Based on
+[rbw](https://github.com/doy/rbw) by Jesse Luehrs.
 
-### Added
+* **Drop-in replacement for rbw.** Same commands, options and config, and the
+  read output (`rbw list --raw`, `rbw get --raw`, ...) is unchanged, so
+  scripts and tools like [rofi-rbw](https://github.com/fdw/rofi-rbw) keep
+  working.
+* **Replaces the official desktop client** for daily use, and **rofi-rbw** if
+  you like: the TUI copies and also types credentials into the previous
+  window.
+* Tested against Vaultwarden 1.37: `tests/vw/e2e.sh` runs 144 checks against
+  a throwaway server and verifies every write with an independent decryptor.
 
-* **Edit every field.** `rbw add` and `rbw edit` set username, password,
-  TOTP, URIs, custom fields (text, hidden, boolean), folder and notes. Without
-  options they open an editor showing all fields; with options they don't open
-  anything (handy for scripts, #220, #365, #35):
+![rbw tui](docs/screenshots/main.png)
 
-  ```sh
-  echo "$PW" | rbw add Example me --uri https://example.com --password-stdin \
-      --totp otpauth://... --field pin=1234 --hidden-field token=abc --folder Web
-  rbw add --secure-note Recipe --notes-file recipe.md
-  echo "$NEW" | rbw edit Example --password-stdin   # old password goes to the history
-  rbw edit Example --rename Example2 --move-to Archive --add-uri https://b.example
-  rbw edit Example --hidden-field token=new --remove-field pin --favorite true
-  ```
-* **Attachments** (#130): `rbw attachment list|get|add|rm <entry>`. `get`
-  saves to the attachment's name (or `-o file`, `-o -` for stdout), `add --file
-  f` uploads (`--file - --name n` from stdin), `rbw add --attach f`. Files are
-  encrypted in the agent with their own key, like the official clients do.
-* **Trash:** `rbw rm` moves the entry to the trash; `rbw trash` lists it,
-  `rbw restore <name>` brings it back, `rbw rm --permanent` deletes for good.
-* **Folders:** `rbw folder list|add|rename|rm`.
-* **Persistent login** (`rbw config set persistent_login true`): when the
-  server rejects the refresh token (on Vaultwarden it expires after 30 days
-  without a sync, #32), the agent logs in again with your personal API key
-  instead of asking for the second factor; `rbw login` uses it too. The key is
-  asked for with the pinentry (prompts `API key client__id` and `API key
-  client__secret`), so a wrapper can answer from a keyring (examples in
-  `contrib/`), and is kept in the agent's memory. Find it in the web vault under
-  *Settings → Security → Keys → View API key*. API key logins skip two factor
-  authentication.
-* **Desktop notification** (`notify-send`, once) when the agent can no longer
-  sync because the login expired, instead of failing silently (`rbw config set
-  notify false` turns it off).
+## Install
 
-### Changed
+| | |
+|---|---|
+| Arch Linux | [`rbw-enhanced`](https://aur.archlinux.org/packages/rbw-enhanced) from the AUR (replaces `rbw`) |
+| From source | `cargo build --release`, then copy `target/release/rbw` and `rbw-agent` to your `PATH` |
 
-* `rbw edit` fetches the entry from the server, re-encrypts only the values
-  that changed and sends everything else back untouched: passkeys,
-  attachments, favorites, archive state, per-item keys and item types rbw
-  doesn't know about survive an edit. The server's revision check rejects the
-  write if the entry changed elsewhere in the meantime. Nothing is written when
-  nothing changed (#21).
-* `rbw rm` moves to the trash (see above).
-* Token refreshes requested by the client go through the agent.
-* Entries of types rbw can't display (bank accounts, passports, driver's
-  licenses) are listed as notes instead of disappearing.
-* The agent protocol is extended, so the fork's `rbw` and `rbw-agent` must be
-  used together (`rbw stop-agent` after installing).
-
-### Fixed
-
-* `rbw add` and `rbw edit` failed with 422 on Vaultwarden 1.34+: they now send
-  `encryptedFor` and `lastKnownRevisionDate` (#385).
-* `rbw edit` corrupted entries with an individual encryption key (#364) and
-  dropped their passkeys, reprompt setting and archive state.
-* `rbw edit` with a non-tty, empty stdin wiped the password and notes; it now
-  refuses (#377).
-* Notes lines starting with `#` were dropped when editing; the new editor
-  keeps them.
-* The agent rewrote its cache in place, so a command reading it at the same
-  moment failed with `EOF while parsing`, and the agent itself took the
-  half-written file for "not logged in" and asked for the master password
-  and the 2FA code again. The cache is now replaced atomically, and only a
-  missing file means logged out.
-* Commands started together on a stopped or locked agent (a script and
-  rofi-rbw, say) each opened their own pinentry, and all but the first
-  usually failed with `Connection refused` or stopped the agent the first had
-  just started. Now they wait for one agent and one prompt: unlocking,
-  logging in and getting a new token happen one at a time.
-
-### Merged upstream pull requests
-
-* #378 persist rotated refresh tokens, stop retrying a rejected one
-* #359 batched decryption (`rbw list` and rofi-rbw are much faster on big
-  vaults)
-* #207 sync and lock timers keep working across system sleep
-* #323 `rbw inject` and `rbw run`
-* #376, #332, #388 lints and RUSTSEC fixes, no panic on disconnected clients,
-  pinentry over ssh
-
----
-
-This is an unofficial command line client for
-[Bitwarden](https://bitwarden.com/). Although Bitwarden does come with its own
-[command line client](https://help.bitwarden.com/article/cli/), it is
-limited by being stateless - to use it, you're required to manually lock and
-unlock the client, and pass the temporary keys around in environment variables,
-which makes it very difficult to use. `rbw` avoids this problem by
-maintaining a background process which is able to hold the keys in memory,
-similar to the way that `ssh-agent` or `gpg-agent` work. This allows the client
-to be used in a much simpler way, with the background agent taking care of
-maintaining the necessary state.
-
-## Maintenance
-
-I consider `rbw` to be essentially feature-complete for me at this point. While
-I still use it on a daily basis, and will continue to fix regressions as they
-occur, I am unlikely to spend time implementing new features on my own. If you
-would like to see new functionality in `rbw`, I am more than happy to review
-and merge pull requests implementing those features.
-
-## Installation
-
-### Arch Linux
-
-`rbw` is available in the [extra
-repository](https://archlinux.org/packages/extra/x86_64/rbw/).
-Alternatively, you can install
-[`rbw-git`](https://aur.archlinux.org/packages/rbw-git/) from the AUR, which
-will always build from the latest master commit.
-
-### Debian/Ubuntu
-
-`rbw` is officially packaged for Debian as
-[`rust-rbw`](https://tracker.debian.org/pkg/rust-rbw) and is available in
-testing (forky). You can install it using `sudo apt install rbw`.
-
-Alternatively, you can download a Debian package from
-[https://git.tozt.net/rbw/releases/deb/
-](https://git.tozt.net/rbw/releases/deb/). The packages are signed by
-[`minisign`](https://github.com/jedisct1/minisign), and can be verified using
-the public key `RWTM0AZ5RpROOfAIWx1HvYQ6pw1+FKwN6526UFTKNImP/Hz3ynCFst3r`.
-
-### Fedora/EPEL
-
-`rbw` is available in [Fedora and EPEL 9](https://bodhi.fedoraproject.org/updates/?packages=rust-rbw)
-(for RHEL and compatible distributions).
-
-You can install it using `sudo dnf install rbw`.
-
-### Homebrew
-
-`rbw` is available in the [Homebrew repository](https://formulae.brew.sh/formula/rbw). You can install it via `brew install rbw`.
-
-### Nix
-
-`rbw` is available in the
-[NixOS repository](https://search.nixos.org/packages?show=rbw). You can try
-it out via `nix-shell -p rbw`.
-
-### Alpine
-
-`rbw` is available in the [community repository](https://pkgs.alpinelinux.org/packages?name=rbw). You can install it with `apk add rbw`.
-
-### Other
-
-With a working Rust installation, `rbw` can be installed via `cargo install
---locked rbw`. This requires that the
-[`pinentry`](https://www.gnupg.org/related_software/pinentry/index.en.html)
-program is installed (to display password prompts).
-
-## Configuration
-
-Configuration options are set using the `rbw config` command. Available
-configuration options:
-
-* `email`: The email address to use as the account name when logging into the
-  Bitwarden server. Required.
-* `sso_id`: The SSO organization ID. Defaults to regular login process if unset.
-* `base_url`: The URL of the Bitwarden server to use. Defaults to the official
-  server at `https://api.bitwarden.com/` if unset.
-* `identity_url`: The URL of the Bitwarden identity server to use. If unset,
-  will use the `/identity` path on the configured `base_url`, or
-  `https://identity.bitwarden.com/` if no `base_url` is set.
-* `ui_url`: The URL of the Bitwarden UI to use. If unset,
-  will default to `https://vault.bitwarden.com/`.
-* `notifications_url`: The URL of the Bitwarden notifications server to use.
-  If unset, will use the `/notifications` path on the configured `base_url`,
-  or `https://notifications.bitwarden.com/` if no `base_url` is set.
-* `lock_timeout`: The number of seconds to keep the master keys in memory for
-  before requiring the password to be entered again. Defaults to `3600` (one
-  hour).
-* `sync_interval`: `rbw` will automatically sync the database from the server
-  at an interval of this many seconds, while the agent is running. Setting
-  this value to `0` disables this behavior. Defaults to `3600` (one hour).
-* `pinentry`: The
-  [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
-  executable to use. Defaults to `pinentry`.
-
-### Profiles
-
-`rbw` supports different configuration profiles, which can be switched
-between by using the `RBW_PROFILE` environment variable. Setting it to a name
-(for example, `RBW_PROFILE=work` or `RBW_PROFILE=personal`) can be used to
-switch between several different vaults - each will use its own separate
-configuration, local vault, and agent.
-
-## Usage
-
-Commands can generally be used directly, and will handle logging in or
-unlocking as necessary. For instance, running `rbw ls` will run `rbw unlock` to
-unlock the password database before generating the list of entries (but will
-not attempt to log in to the server), `rbw sync` will automatically run `rbw
-login` to log in to the server before downloading the password database (but
-will not unlock the database), and `rbw add` will do both.
-
-Logging into the server and unlocking the database will only be done as
-necessary, so running `rbw login` when you are already logged in will do
-nothing, and similarly for `rbw unlock`. If necessary, you can explicitly log
-out by running `rbw purge`, and you can explicitly lock the database by running
-`rbw lock` or `rbw stop-agent`.
-
-`rbw help` can be used to get more information about the available
-functionality.
-
-Run `rbw get <name>` to get your passwords. If you also want to get the username
-or the note associated, you can use the flag `--full`. You can also use the flag
-`--field={field}` to get whatever default or custom field you want. The `--raw`
-flag will show the output as JSON. In addition to matching against the name,
-you can pass a UUID as the name to search for the entry with that id, or a
-URL to search for an entry with a matching website entry.
-
-### Template and command injection
-
-`rbw inject` can render templates containing secret references. References use
-the format `bw://<uuid-or-name>?field=<field>`, where the item can be addressed
-by UUID or by an exact name consisting only of letters, digits, `-`, and `_`.
-For items whose names contain spaces or other punctuation, use the item UUID
-instead. If `field` is omitted, the entry password is used. References can be
-written directly in the template or wrapped in `{{ bw://... }}`.
-
-By default, `rbw inject` reads the template from stdin and writes the rendered
-output to stdout. Use `--in-file` and `--out-file` to work with files instead:
+The client and the agent must come from the same build: after upgrading, run
+`rbw stop-agent`.
 
 ```sh
-echo 'database_password={{ bw://db-prod?field=password }}' | rbw inject
-rbw inject --in-file config.tpl --out-file config.yaml
+rbw config set email you@example.com
+rbw config set base_url https://vault.example.com   # omit for bitwarden.com
+rbw login
+rbw tui
 ```
 
-`rbw run` reads environment bindings from `./.env` by default (or another file
-with `--env-file`), parses them using dotenv syntax, resolves any `bw://`
-references in the resulting values, and then runs the requested command without
-going through a shell:
+## The TUI
+
+`rbw tui` opens in about the time of `rbw list` and filters as you type
+(fuzzy, with `'exact`, `^prefix`, `suffix$`, `!not`); the entries you use
+most come first.
+
+| Keys | |
+|---|---|
+| `^P` `^U` `^T` | copy password, username, TOTP code (cleared after 30 s) |
+| `Alt+P` `Alt+U` `Alt+T` | type them into the previous window and quit, like rofi-rbw |
+| `Enter` | menu with every action on the entry; on a field (`Tab`), copy or type it |
+| `←` | sidebar: favorites, types, vaults, collections, folders, archive, trash |
+| `^N` | new item: login, card, identity, secure note or SSH key, in your vault or an organization's collection |
+| `^E` `^D` | edit in your editor, move to the trash |
+| `^F` `^A` | favorite, archive |
+| `^G` | password generator |
+| `^R` `^O` `^S` `^L` | show secrets, open the URL, sync, lock |
+| `F2` | security settings, see below |
+
+![actions](docs/screenshots/actions.png)
+![new item](docs/screenshots/new-item.png)
+
+Typing gives the focus back with the compositor (Hyprland, niri) and types
+with `dotool`, `wtype`, `ydotool` or `xdotool`, whichever is installed.
+
+## Unlocking
+
+The same options as the official clients' security settings, from `F2` in
+the TUI, `rbw security` or `rbw config set`. They apply without restarting
+the agent.
+
+| Official client | rbw-enhanced |
+|---|---|
+| Session timeout (1 min … 4 h, custom, never) | `lock_timeout 1h` / `90m` / `never` |
+| Lock when idle, on sleep | `lock_on_idle true`, `lock_on_sleep true` (from logind) |
+| Timeout action: lock / log out | `timeout_action lock` / `forget` |
+| Unlock with PIN | `rbw pin set` (argon2id, 5 attempts) |
+| Unlock with system authentication | `system_auth true` (polkit: howdy, fprintd, password) |
+| Require master password on restart (off) | `rbw remember-password`: the master password is sealed with `systemd-creds` (TPM2 when present) or the Secret Service |
+| | `auto_unlock true`: unlock with the saved password without asking |
+| | `tui_auth true`: system authentication once per login session to open the TUI |
+
+![security settings](docs/screenshots/settings.png)
+
+A common setup: always unlocked after the desktop login, face recognition
+only to open the TUI.
 
 ```sh
-cat > .env <<'EOF'
-DATABASE_URL=postgres://app:bw://db-prod?field=password@db.example/app
-API_TOKEN=bw://deploy-token
-EOF
-
-rbw run -- env
-rbw run --env-file .env.local -- docker compose up -d
+rbw remember-password
+rbw config set auto_unlock true
+rbw config set tui_auth true
+rbw config set lock_timeout never
 ```
 
-*Note to users of the official Bitwarden server (at bitwarden.com)*: The
-official server has a tendency to detect command line traffic as bot traffic
-(see [this issue](https://github.com/bitwarden/cli/issues/383) for details). In
-order to use `rbw` with the official Bitwarden server, you will need to first
-run `rbw register` to register each device using `rbw` with the Bitwarden
-server. This will prompt you for your personal API key which you can find using
-the instructions [here](https://bitwarden.com/help/article/personal-api-key/).
+System authentication needs a polkit action and, for howdy, two small system
+changes: see [contrib/polkit](contrib/polkit/README.md).
 
-### SSH Agent
-
-`rbw-agent` includes a built-in SSH agent for signing SSH authentication
-challenges directly. To use it, ensure that rbw is running (in order to make
-it start handling ssh agent requests), and then point your SSH client to the
-SSH agent socket:
+## Writing to the vault
 
 ```sh
-rbw unlock
-export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent-socket"
+echo "$PW" | rbw add Example me --uri https://example.com --password-stdin \
+    --totp otpauth://... --field pin=1234 --hidden-field token=abc --folder Web
+rbw add Card --type card                     # login, note, card, identity, ssh-key
+rbw add Wiki --org Acme --collection Engineering
+rbw edit Example                             # every field in your editor
+echo "$NEW" | rbw edit Example --password-stdin   # old password goes to the history
+rbw edit Example --rename Example2 --move-to Archive --favorite true
+rbw rm Example                               # to the trash: rbw trash, rbw restore
+rbw archive Example                          # rbw unarchive
+rbw folder list|add|rename|rm
+rbw attachment list|get|add|rm Example
 ```
 
-If you're using a profile, the socket will be located at
-`"XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent-socket"`.
+Edits fetch the entry from the server, re-encrypt only what changed and send
+the rest back untouched: passkeys, attachments, per-item keys and item types
+rbw doesn't know about survive. The server's revision check rejects an edit
+if the entry changed elsewhere.
 
-### 2FA support
+## More
 
-`rbw` supports the following 2FA mechanisms :
+* **Persistent login** (`persistent_login true`): when the refresh token is
+  rejected (Vaultwarden expires it after 30 days without a sync), the agent
+  logs in again with your personal API key instead of asking for the second
+  factor. A desktop notification tells you if the login expires anyway.
+* **Status for bars:** `rbw status --json` never starts the agent or prompts.
+  A [Noctalia](https://github.com/noctalia-dev) bar plugin built on it is in
+  [rylos/community-plugins](https://github.com/rylos/community-plugins/tree/rbw/rbw-enhanced).
+* **Usage ranking:** `rbw get` and `rbw code` record what you use (ids only);
+  the TUI always sorts by it, `sort_by_usage true` also sorts `rbw list`.
+* **From upstream pull requests:** rotated refresh tokens are kept (#378),
+  batched decryption, so `rbw list` is much faster on big vaults (#359),
+  timers survive system sleep (#207), `rbw inject` and `rbw run` (#323).
+* **Fixes:** writes failing with 422 on Vaultwarden 1.34+ (#385), edits
+  corrupting entries with their own key (#364) or wiping them from an empty
+  stdin (#377), cache read while being rewritten, several pinentries for
+  commands started together.
 
-* Email
-* Authenticator App
-* Yubico OTP security key (https://support.yubico.com/hc/en-us/articles/360013712639-Testing-Yubico-OTP)
+For everything inherited from rbw (configuration, profiles, SSH agent, 2FA,
+`rbw inject`), see the [upstream README](https://github.com/doy/rbw#readme).
 
-WebAuthn / Passkey and Duo security are unsupported 2FA mechanisms.
+## Credits
 
-If you use only unsupported 2FA mechanism, you need to add a supported 2FA
-mechanism on your bitwarden account to use rbw. It allows you to use rbw
-with a supported mechanism, and use other clients with you preferred
-2FA mechanism.
-
-## Related projects
-
-* [rofi-rbw](https://github.com/fdw/rofi-rbw): A rofi frontend for Bitwarden
-* [bw-ssh](https://framagit.org/Glandos/bw-ssh/): Manage SSH key passphrases in Bitwarden
-* [rbw-menu](https://github.com/rbuchberger/rbw-menu): Tiny menu picker for rbw
-* [ulauncher-rbw](https://0xacab.org/varac-projects/ulauncher-rbw): [Ulauncher](https://ulauncher.io/) rbw extension
-* [fuzzel-rbw](https://github.com/sammhansen/fuzzel-rbw): A fuzzel frontend for Bitwarden
+rbw is written by [Jesse Luehrs](https://github.com/doy); this fork builds
+on his work and keeps its MIT license (see [LICENSE](LICENSE)).

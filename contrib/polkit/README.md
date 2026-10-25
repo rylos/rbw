@@ -23,6 +23,11 @@ dialog. Cancelling it falls back to the master password.
            /etc/systemd/system/polkit-agent-helper@.service.d/biometric.conf
        systemctl daemon-reload
 
+   If your camera needs something started first (an IR emitter, a
+   v4l2loopback bridge), copy the lines your `/etc/pam.d/sudo` has before
+   `pam_howdy.so` into `polkit-1` too: every failed attempt counts for
+   `pam_faillock`, which locks the account after three.
+
 4. Make sure a polkit agent runs in your session (Plasma, GNOME do; on
    Hyprland or niri use e.g. `hyprpolkitagent` or `polkit-kde-agent`).
 
