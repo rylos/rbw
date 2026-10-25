@@ -96,7 +96,7 @@ impl Settings {
     // what changing a row does, for the line under the list
     pub fn describe(row: usize) -> &'static str {
         match row {
-            0 => "when rbw locks by itself (idle and sleep come from logind)",
+            0 => "when rbw-enhanced locks by itself (idle and sleep come from logind)",
             1 => {
                 "lock keeps the keys for a pin or system unlock; log out \
                   needs the master password again"

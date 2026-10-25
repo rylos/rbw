@@ -1075,7 +1075,7 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) {
         ),
         (
             format!(
-                "{} Ask system authentication to open rbw tui",
+                "{} Ask system authentication to open the TUI",
                 check(settings.tui_auth)
             ),
             String::new(),
@@ -1154,7 +1154,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         ),
         Style::new().fg(DIM),
     )));
-    draw_popup(f, area, "rbw tui", lines);
+    draw_popup(f, area, "rbw-enhanced", lines);
 }
 
 fn host(uri: &str) -> String {
