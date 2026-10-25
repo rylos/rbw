@@ -1711,6 +1711,7 @@ impl App {
                 ("←", "views"),
                 ("^E", "edit"),
                 ("^N", "new"),
+                ("^D", "trash"),
                 ("^G", "generate"),
                 ("F1", "help"),
             ]
