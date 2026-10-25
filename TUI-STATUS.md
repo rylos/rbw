@@ -26,6 +26,8 @@ Lock and unlock settings, mirroring the official "Security" page:
 | unlock with PIN | `rbw pin set` / `rbw pin clear` (`src/pin.rs`, argon2id, 5 tries) |
 | unlock with system authentication | `system_auth` (polkit `net.rbw.unlock`) |
 | require master password on restart | unchecked = `rbw remember-password` |
+| (not in the official client) | `auto_unlock`: unlock with the saved password without asking |
+| (not in the official client) | `tui_auth`: polkit once per login session to open `rbw tui` |
 
 - unlock order: system (polkit) → pin → master password; the first two
   only when there is something to reuse (kept keys or saved password).
@@ -50,7 +52,7 @@ Lock and unlock settings, mirroring the official "Security" page:
 - startup ≈ `rbw list` (≈ 40 ms on the real 1681-entry vault).
 
 ### Tests
-- `bash tests/vw/e2e.sh`: 93/93 (polkit faked; tui driven with tmux).
+- `bash tests/vw/e2e.sh`: 101/101 (polkit faked; tui driven with tmux).
 - `tests/vw/dev-vault.sh`: throwaway vault on :8223 for trying the tui
   (`PATH=target/debug:$PATH RBW_PROFILE=rbwdev rbw tui`).
 - Real polkit + howdy tested on pc-casa with the dev vault: first unlock
@@ -81,8 +83,19 @@ Lock and unlock settings, mirroring the official "Security" page:
   `rbw-enhanced 1.15.0.r32.g30c786d-1`, built from a copy of the PKGBUILD
   in a temporary directory (`~/pkgbuilds` and AUR untouched). Old binaries
   in `~/.local/share/rbw-rollback/`. `list --raw` and 40 `get --raw`
-  identical to before (rofi-rbw). Settings unchanged so far: Marco picks
-  them (F2).
+  identical to before (rofi-rbw). Now `r34.gfd0f7e0`.
+- Marco's setup (pc-casa, 2026-10-25): always unlocked after the desktop
+  login, rofi as before, face only to open the tui (once per login
+  session). Done with `rbw remember-password` (systemd-creds, TPM2),
+  `auto_unlock true`, `tui_auth true`, and `~/.config/systemd/user/
+  rbw-unlock.service` reduced to `ExecStart=rbw unlock` (no KWallet wait;
+  backup `.bak-20261025`). Tested: unlock from the TPM with
+  `pinentry=/bin/false` in 0.39 s. The master password is still in
+  KWallet too (fallback of pinentry-rbw): remove it after a reboot test.
+- `TERMINAL=foot` in `~/.config/hypr/hyprland.lua` (backup
+  `.bak-20261025-terminal`) and `~/.config/environment.d/terminal.conf`:
+  without it Noctalia's runInTerminal picked ghostty. Effective from the
+  next login.
 - Noctalia: plugin copied to `~/.local/share/noctalia/plugins/rbw/`, enabled,
   widget `rbw` (type `rylos/rbw-enhanced:bar`) added to the default bar after `bar_2`
   (`~/.local/state/noctalia/settings.toml`, backup
