@@ -955,6 +955,7 @@ impl App {
                 ("^O", "open"),
                 ("⇥", "fields"),
                 ("^E", "edit"),
+                ("^N", "new"),
                 ("F1", "help"),
                 ("F2", "security"),
             ]
