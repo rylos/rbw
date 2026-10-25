@@ -89,6 +89,8 @@ arboard = { version = "3.6.1", default-features = false, features = [
     "wayland-data-control",
 ], optional = true }
 dotenvy = "0.15.7"
+ratatui = "0.29.0"
+nucleo-matcher = "0.3.1"
 
 [features]
 default = ["clipboard"]

@@ -278,6 +278,33 @@ check "usage keeps only ids" 0 "$(grep -c -E 'nota|flags' "$HOME/.local/share/rb
 rbw config set sort_by_usage false
 check "and alphabetical without it" "$(rbw list | sort | head -1)" "$(rbw list | head -1)"
 
+echo "== tui"
+if command -v tmux >/dev/null; then
+    screen() { tmux capture-pane -p -t rbw-e2e 2>/dev/null; }
+    wait_screen() {
+        for _ in $(seq 1 50); do screen | grep -q -- "$1" && return 0; sleep 0.1; done
+        return 1
+    }
+    tmux kill-session -t rbw-e2e 2>/dev/null || true
+    tmux new-session -d -s rbw-e2e -x 120 -y 30 "env PATH='$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    check "tui starts with every entry listed" 0 "$(wait_screen "/$(rbw list | wc -l) " ; echo $?)"
+    tmux send-keys -t rbw-e2e 'flags'
+    check "typing filters" 0 "$(wait_screen ' 1/' ; echo $?)"
+    check "secrets are masked" 0 "$(wait_screen '••••' ; echo $?)"
+    tmux send-keys -t rbw-e2e C-r
+    check "^R reveals them" 0 "$(wait_screen 'pw-api' ; echo $?)"
+    rbw lock
+    check "a lock elsewhere hides the details" 0 "$(wait_screen 'locked: Enter' ; echo $?)"
+    check "  and the secrets are gone from the screen" 1 "$(screen | grep -c 'pw-api')"
+    tmux send-keys -t rbw-e2e Tab
+    check "Tab unlocks again" 0 "$(wait_screen 'password' ; echo $?)"
+    tmux send-keys -t rbw-e2e Escape Escape
+    for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
+    check "Esc twice quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
+else
+    echo "skipped (no tmux)"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

@@ -238,6 +238,10 @@ pub enum Action {
     RefreshToken,
     ClipboardStore {
         text: String,
+        // clear the clipboard after this many seconds, unless something
+        // else was copied in the meantime
+        #[serde(default)]
+        clear_after: Option<u64>,
     },
     Quit,
     Version,

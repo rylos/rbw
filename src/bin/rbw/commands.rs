@@ -3701,6 +3701,241 @@ fn display_field(name: &str, field: Option<&str>, clipboard: bool) -> bool {
     )
 }
 
+// what the tui lists: nothing secret, decrypted for the whole vault with a
+// single agent round trip
+pub struct TuiEntry {
+    pub id: String,
+    pub name: String,
+    pub user: Option<String>,
+    pub folder: Option<String>,
+    pub uris: Vec<String>,
+    pub kind: &'static str,
+    pub reprompt: bool,
+    pub attachments: usize,
+}
+
+pub fn tui_entries(db: &rbw::db::Db) -> anyhow::Result<Vec<TuiEntry>> {
+    let fields = [
+        ListField::Name,
+        ListField::User,
+        ListField::Folder,
+        ListField::Uri,
+    ];
+    let decrypted = batch_decrypt(&db.entries, |entry, decryptor| {
+        decrypt_list_cipher(entry, &fields, decryptor)
+    })?;
+    Ok(db
+        .entries
+        .iter()
+        .zip(decrypted)
+        .map(|(entry, decrypted)| TuiEntry {
+            id: entry.id.clone(),
+            name: decrypted.name.unwrap_or_default(),
+            user: decrypted.user.filter(|u| !u.is_empty()),
+            folder: decrypted.folder,
+            uris: decrypted.uris.unwrap_or_default(),
+            kind: match &entry.data {
+                rbw::db::EntryData::Login { .. } => "login",
+                rbw::db::EntryData::Identity { .. } => "identity",
+                rbw::db::EntryData::SshKey { .. } => "ssh key",
+                rbw::db::EntryData::SecureNote => "note",
+                rbw::db::EntryData::Card { .. } => "card",
+            },
+            reprompt: entry.master_password_reprompt(),
+            attachments: entry.attachments.len(),
+        })
+        .collect())
+}
+
+// one value of an entry, as the tui shows it
+#[derive(Clone)]
+pub struct TuiValue {
+    pub label: String,
+    pub value: String,
+    pub secret: bool,
+}
+
+#[derive(Clone)]
+pub struct TuiDetails {
+    // the value Enter copies: password, card number, notes, public key
+    pub primary: Option<String>,
+    pub username: Option<String>,
+    pub totp: Option<String>,
+    pub values: Vec<TuiValue>,
+    pub notes: Option<String>,
+    pub history: usize,
+    pub attachments: Vec<String>,
+}
+
+// decrypts everything, so for entries with master password reprompt this
+// asks for the master password
+pub fn tui_details(db: &rbw::db::Db, id: &str) -> anyhow::Result<TuiDetails> {
+    let entry = db
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
+    let decrypted = decrypt_cipher_batched(entry)?;
+    let value = |label: &str, value: &Option<String>, secret: bool| {
+        value.as_ref().filter(|v| !v.is_empty()).map(|v| TuiValue {
+            label: label.to_string(),
+            value: v.clone(),
+            secret,
+        })
+    };
+    let mut details = TuiDetails {
+        primary: None,
+        username: None,
+        totp: None,
+        values: vec![],
+        notes: decrypted.notes.clone().filter(|n| !n.is_empty()),
+        history: decrypted.history.len(),
+        attachments: decrypted
+            .attachments
+            .iter()
+            .map(|a| a.file_name.clone().unwrap_or_else(|| a.id.clone()))
+            .collect(),
+    };
+    match &decrypted.data {
+        DecryptedData::Login {
+            username,
+            password,
+            totp,
+            uris,
+        } => {
+            details.primary.clone_from(password);
+            details.username.clone_from(username);
+            details.totp.clone_from(totp);
+            details.values.extend(value("username", username, false));
+            details.values.extend(value("password", password, true));
+            for uri in uris.iter().flatten() {
+                details.values.push(TuiValue {
+                    label: "uri".to_string(),
+                    value: uri.uri.clone(),
+                    secret: false,
+                });
+            }
+        }
+        DecryptedData::Card {
+            cardholder_name,
+            number,
+            brand,
+            exp_month,
+            exp_year,
+            code,
+        } => {
+            details.primary.clone_from(number);
+            details.values.extend(value(
+                "cardholder",
+                cardholder_name,
+                false,
+            ));
+            details.values.extend(value("number", number, true));
+            details.values.extend(value("brand", brand, false));
+            if let (Some(m), Some(y)) = (exp_month, exp_year) {
+                details.values.push(TuiValue {
+                    label: "expires".to_string(),
+                    value: format!("{m}/{y}"),
+                    secret: false,
+                });
+            }
+            details.values.extend(value("code", code, true));
+        }
+        DecryptedData::Identity {
+            title,
+            first_name,
+            middle_name,
+            last_name,
+            address1,
+            address2,
+            address3,
+            city,
+            state,
+            postal_code,
+            country,
+            phone,
+            email,
+            ssn,
+            license_number,
+            passport_number,
+            username,
+        } => {
+            let name: Vec<_> = [title, first_name, middle_name, last_name]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            if !name.is_empty() {
+                details.values.push(TuiValue {
+                    label: "name".to_string(),
+                    value: name.join(" "),
+                    secret: false,
+                });
+            }
+            details.username.clone_from(username);
+            for (label, v, secret) in [
+                ("username", username, false),
+                ("email", email, false),
+                ("phone", phone, false),
+                ("address", address1, false),
+                ("address", address2, false),
+                ("address", address3, false),
+                ("city", city, false),
+                ("state", state, false),
+                ("postal code", postal_code, false),
+                ("country", country, false),
+                ("ssn", ssn, true),
+                ("license", license_number, true),
+                ("passport", passport_number, true),
+            ] {
+                details.values.extend(value(label, v, secret));
+            }
+        }
+        DecryptedData::SecureNote => {
+            details.primary.clone_from(&details.notes);
+        }
+        DecryptedData::SshKey {
+            public_key,
+            fingerprint,
+            private_key,
+        } => {
+            details.primary.clone_from(public_key);
+            details
+                .values
+                .extend(value("public key", public_key, false));
+            details
+                .values
+                .extend(value("fingerprint", fingerprint, false));
+            details
+                .values
+                .extend(value("private key", private_key, true));
+        }
+    }
+    for field in &decrypted.fields {
+        let secret = field.ty == Some(rbw::api::FieldType::Hidden);
+        details.values.extend(value(
+            field.name.as_deref().unwrap_or("field"),
+            &field.value,
+            secret,
+        ));
+    }
+    Ok(details)
+}
+
+// the current code and the seconds it stays valid
+pub fn tui_totp(secret: &str) -> anyhow::Result<(String, u64)> {
+    let code = generate_totp(secret)?;
+    let period = parse_totp_secret(secret).map_or(30, |p| p.period.max(1));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Ok((code, period - now % period))
+}
+
+pub fn tui_ensure_unlocked() -> anyhow::Result<()> {
+    unlock()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

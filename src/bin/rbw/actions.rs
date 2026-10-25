@@ -273,6 +273,14 @@ pub fn refresh_token() -> anyhow::Result<()> {
 pub fn clipboard_store(text: &str) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::ClipboardStore {
         text: text.to_string(),
+        clear_after: None,
+    })
+}
+
+pub fn clipboard_store_for(text: &str, seconds: u64) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ClipboardStore {
+        text: text.to_string(),
+        clear_after: Some(seconds),
     })
 }
 

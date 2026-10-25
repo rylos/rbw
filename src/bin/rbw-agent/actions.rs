@@ -1287,12 +1287,28 @@ pub async fn clipboard_store(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     text: &str,
+    clear_after: Option<u64>,
 ) -> anyhow::Result<()> {
-    let mut state = state.lock().await;
-    if let Some(clipboard) = &mut state.clipboard {
-        clipboard.set_text(text).map_err(|e| {
-            anyhow::anyhow!("couldn't store value to clipboard: {e}")
-        })?;
+    {
+        let mut state = state.lock().await;
+        if let Some(clipboard) = &mut state.clipboard {
+            clipboard.set_text(text).map_err(|e| {
+                anyhow::anyhow!("couldn't store value to clipboard: {e}")
+            })?;
+        }
+    }
+
+    if let Some(seconds) = clear_after {
+        let text = zeroize::Zeroizing::new(text.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            let mut state = state.lock().await;
+            if let Some(clipboard) = &mut state.clipboard {
+                if clipboard.get_text().is_ok_and(|t| *t == **text) {
+                    let _ = clipboard.clear();
+                }
+            }
+        });
     }
 
     respond_ack(sock).await?;
@@ -1305,6 +1321,7 @@ pub async fn clipboard_store(
     sock: &mut crate::sock::Sock,
     _state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     _text: &str,
+    _clear_after: Option<u64>,
 ) -> anyhow::Result<()> {
     sock.send(&rbw::protocol::Response::Error {
         error: "clipboard not supported".to_string(),

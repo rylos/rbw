@@ -11,6 +11,7 @@ mod actions;
 mod commands;
 mod items;
 mod sock;
+mod tui;
 
 #[derive(Debug, clap::Args)]
 struct FindArgs {
@@ -234,6 +235,9 @@ enum Opt {
 
     #[command(about = "Update the local copy of the Bitwarden database")]
     Sync,
+
+    #[command(about = "Search the vault interactively and copy values")]
+    Tui,
 
     #[command(
         about = "List all entries in the local Bitwarden database",
@@ -553,6 +557,7 @@ impl Opt {
             Self::Status { .. } => "status".to_string(),
             Self::Biometric { .. } => "biometric".to_string(),
             Self::Sync => "sync".to_string(),
+            Self::Tui => "tui".to_string(),
             Self::List { .. } => "list".to_string(),
             Self::Get { .. } => "get".to_string(),
             Self::Search { .. } => "search".to_string(),
@@ -654,6 +659,7 @@ fn main() {
             BiometricCommand::Status => commands::biometric_status(),
         },
         Opt::Sync => commands::sync(),
+        Opt::Tui => tui::run(),
         Opt::List { fields, raw } => commands::list(&fields, raw),
         Opt::Get {
             find_args,

@@ -254,9 +254,14 @@ async fn handle_request(
                 .await?;
             false
         }
-        rbw::protocol::Action::ClipboardStore { text } => {
-            crate::actions::clipboard_store(sock, state.clone(), text)
-                .await?;
+        rbw::protocol::Action::ClipboardStore { text, clear_after } => {
+            crate::actions::clipboard_store(
+                sock,
+                state.clone(),
+                text,
+                *clear_after,
+            )
+            .await?;
             true
         }
         rbw::protocol::Action::Quit => std::process::exit(0),
