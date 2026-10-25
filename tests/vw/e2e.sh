@@ -147,6 +147,54 @@ r = Rbw()
 print(sum(1 for e in r.list_entries() if r.fetch_credentials(e)))')"
 fi
 
+echo "== types, organizations, archive"
+cat >"$WORK/editor-card" <<'EOF'
+#!/bin/sh
+sed -i 's/^cardholder: .*/cardholder: Mario Rossi/; s/^number: .*/number: 4111111111111111/; s/^exp month: .*/exp month: 12/; s/^code: .*/code: 123/' "$1"
+EOF
+chmod +x "$WORK/editor-card"
+VISUAL=$WORK/editor-card script -qec "rbw add visa --type card" /dev/null >/dev/null
+check "add a card in the editor" '{"cardholderName":"Mario Rossi","number":"4111111111111111","expMonth":"12","code":"123"}' \
+    "$(item visa '.card | {cardholderName, number, expMonth, code}')"
+cat >"$WORK/editor-code" <<'EOF'
+#!/bin/sh
+sed -i 's/^code: .*/code: 999/' "$1"
+EOF
+chmod +x "$WORK/editor-code"
+VISUAL=$WORK/editor-code script -qec "rbw edit visa" /dev/null >/dev/null
+check "edit a card changes only its code" '{"number":"4111111111111111","code":"999"}' "$(item visa '.card | {number, code}')"
+cat >"$WORK/editor-identity" <<'EOF'
+#!/bin/sh
+sed -i 's/^first name: .*/first name: Mario/; s/^email: .*/email: mario@example.com/' "$1"
+EOF
+chmod +x "$WORK/editor-identity"
+VISUAL=$WORK/editor-identity script -qec "rbw add io --type identity" /dev/null >/dev/null
+check "add an identity" '{"firstName":"Mario","email":"mario@example.com"}' "$(item io '.identity | {firstName, email}')"
+rbw add chiave --type ssh-key --no-edit
+item chiave '.sshKey.privateKey' | jq -r . >"$WORK/id_test"
+chmod 600 "$WORK/id_test"
+check "add an ssh key generates an ed25519 key" "$(ssh-keygen -y -f "$WORK/id_test")" "$(item chiave '.sshKey.publicKey' | jq -r .)"
+check "  with its fingerprint" "$(ssh-keygen -lf "$WORK/id_test" | cut -d' ' -f2)" "$(item chiave '.sshKey.keyFingerprint' | jq -r .)"
+check "unknown type refused" 1 "$(rbw add x --type bogus --no-edit >/dev/null 2>&1; echo $?)"
+
+bw mkorg Azienda Generale Progetti >/dev/null
+rbw sync
+check "sync keeps organizations and collections" '{"orgs":["Azienda"],"collections":2}' \
+    "$(jq -c '{orgs: [.organizations[].name], collections: (.collections | length)}' "$(db)")"
+rbw add interno utente --org Azienda --collection Progetti --no-edit
+check "add in an organization collection" '{"org":"Azienda","collections":["Progetti"],"username":"utente"}' \
+    "$(item interno '{org, collections, username: .login.username}')"
+check "  and rbw reads it back" utente "$(rbw get interno --field username)"
+check "an organization item needs a collection" 1 "$(rbw add y --org Azienda --no-edit >/dev/null 2>&1; echo $?)"
+check "unknown collection refused" 1 "$(rbw add y --org Azienda --collection Nope --no-edit >/dev/null 2>&1; echo $?)"
+
+rbw archive io
+check "archive" true "$(item io .archived)"
+check "  synced into the db" true "$(jq -r '.entries[] | select(.id == "'"$(rbw get --raw io | jq -r .id)"'") | .archived' "$(db)")"
+check "  still listed for rofi-rbw" 1 "$(rbw list | grep -cx io)"
+rbw unarchive io
+check "unarchive" false "$(item io .archived)"
+
 echo "== concurrent writes and reads"
 # every save of the agent used to truncate the cache before writing it: a
 # command reading it in that moment failed with "EOF while parsing", and the
@@ -383,7 +431,7 @@ if command -v tmux >/dev/null; then
         return 1
     }
     tmux kill-session -t rbw-e2e 2>/dev/null || true
-    tmux new-session -d -s rbw-e2e -x 120 -y 30 "env PATH='$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env PATH='$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' VISUAL='$WORK/editor-card' rbw tui"
     check "tui starts with every entry listed" 0 "$(wait_screen "/$(rbw list | wc -l)\$" ; echo $?)"
     tmux send-keys -t rbw-e2e 'flags'
     check "typing filters" 0 "$(wait_screen ' 1/' ; echo $?)"
@@ -395,9 +443,49 @@ if command -v tmux >/dev/null; then
     check "  and the secrets are gone from the screen" 0 "$(screen | grep -c 'pw-api')"
     tmux send-keys -t rbw-e2e Tab
     check "Tab unlocks again" 0 "$(wait_screen 'password' ; echo $?)"
-    # back from the fields, clear the filter, quit
+    # back from the fields, clear the filter
     # one at a time: escapes sent together read as alt sequences
-    for _ in 1 2 3; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done
+    for _ in 1 2; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done
+    check "the sidebar lists the organization" 0 "$(wait_screen 'Azienda' ; echo $?)"
+    tmux send-keys -t rbw-e2e Left Down
+    check "favorites view" 0 "$(wait_screen '╭ Favorites ─' ; echo $?)"
+    check "  lists the favorites" 0 "$(wait_screen ' 2/' ; echo $?)"
+    tmux send-keys -t rbw-e2e Enter C-f
+    check "^F removes a favorite" 0 "$(wait_screen 'removed from the favorites' ; echo $?)"
+    check "  and the view follows" 0 "$(wait_screen ' 1/' ; echo $?)"
+    tmux send-keys -t rbw-e2e Left Up Enter
+    tmux send-keys -t rbw-e2e 'visa'
+    check "back to all items" 0 "$(wait_screen '╭ All items ─' ; echo $?)"
+    tmux send-keys -t rbw-e2e C-a
+    check "^A archives" 0 "$(wait_screen 'archived' ; echo $?)"
+    check "  and hides it from all items" 0 "$(wait_screen ' 0/' ; echo $?)"
+    check "  on the server" true "$(item visa .archived)"
+    tmux send-keys -t rbw-e2e C-w
+    rbw rm interno
+    tmux send-keys -t rbw-e2e Left End
+    check "trash view lists the trash" 0 "$(wait_screen 'interno  deleted' ; echo $?)"
+    tmux send-keys -t rbw-e2e Enter Enter
+    check "Enter restores from the trash" 0 "$(wait_screen 'restored' ; echo $?)"
+    check "  on the server" false "$(item interno .deleted)"
+    tmux send-keys -t rbw-e2e Left Up
+    check "archive view" 0 "$(wait_screen '╭ Archive ─' ; echo $?)"
+    tmux send-keys -t rbw-e2e Enter C-a
+    check "^A unarchives there" 0 "$(wait_screen 'unarchived' ; echo $?)"
+    tmux send-keys -t rbw-e2e Left Home Enter
+    tmux send-keys -t rbw-e2e C-g
+    check "^G opens the generator" 0 "$(wait_screen '‹ 20 characters ›' ; echo $?)"
+    tmux send-keys -t rbw-e2e Left
+    check "  ← shortens it" 0 "$(wait_screen '‹ 19 characters ›' ; echo $?)"
+    tmux send-keys -t rbw-e2e Escape
+    sleep 0.2
+    tmux send-keys -t rbw-e2e 'tessera'
+    tmux send-keys -t rbw-e2e C-n
+    check "^N asks type and vault" 0 "$(wait_screen 'Vault       ‹ My vault ›' ; echo $?)"
+    tmux send-keys -t rbw-e2e Right Down Right Down Down Enter
+    check "  and creates it" 0 "$(wait_screen 'added' ; echo $?)"
+    check "  a card in the organization, named after the filter" \
+        '{"type":3,"org":"Azienda","number":"4111111111111111"}' "$(item tessera '{type, org, number: .card.number}')"
+    for _ in 1 2; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done
     for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
     check "Esc quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
 else

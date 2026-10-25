@@ -124,10 +124,23 @@ pub fn unlock<S: std::hash::BuildHasher>(
         Err(e) => return Err(e),
     };
 
+    let org_keys =
+        decrypt_org_keys(&key, protected_private_key, protected_org_keys)?;
+
+    Ok((key, org_keys))
+}
+
+// the organization keys, decrypted with the user's private key; also used
+// after a sync, for organizations joined while unlocked
+pub fn decrypt_org_keys<S: std::hash::BuildHasher>(
+    key: &crate::locked::Keys,
+    protected_private_key: &str,
+    protected_org_keys: &std::collections::HashMap<String, String, S>,
+) -> Result<std::collections::HashMap<String, crate::locked::Keys>> {
     let protected_private_key =
         crate::cipherstring::CipherString::new(protected_private_key)?;
     let private_key = crate::locked::PrivateKey::new(
-        protected_private_key.decrypt_locked_symmetric(&key)?,
+        protected_private_key.decrypt_locked_symmetric(key)?,
     );
 
     let mut org_keys = std::collections::HashMap::new();
@@ -139,18 +152,10 @@ pub fn unlock<S: std::hash::BuildHasher>(
         );
         org_keys.insert(org_id.clone(), org_key);
     }
-
-    Ok((key, org_keys))
+    Ok(org_keys)
 }
 
-pub async fn sync_once(
-    access_token: &str,
-) -> Result<(
-    String,
-    String,
-    std::collections::HashMap<String, String>,
-    Vec<crate::db::Entry>,
-)> {
+pub async fn sync_once(access_token: &str) -> Result<crate::api::SyncData> {
     let (client, _) = api_client_async().await?;
     client.sync(access_token).await
 }

@@ -3,9 +3,11 @@
   bwtool.py URL EMAIL PASSWORD dump              decrypt the whole vault (incl. attachments' sha256)
   bwtool.py URL EMAIL PASSWORD mkkeyed NAME      create a login that has its own item key
   bwtool.py URL EMAIL PASSWORD apikey            print the personal api key (client_id client_secret)
+  bwtool.py URL EMAIL PASSWORD mkorg NAME COLL...  create an organization with these collections
 """
 import base64, hashlib, hmac, json, os, sys, urllib.parse, urllib.request, uuid
-from cryptography.hazmat.primitives import hashes, padding as sympad
+from cryptography.hazmat.primitives import hashes, padding as sympad, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asympad, rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
@@ -13,7 +15,8 @@ url, email, password, cmd = sys.argv[1:5]
 b64, unb64 = (lambda b: base64.b64encode(b).decode()), base64.b64decode
 
 def req(method, path, body=None, token=None, form=False, raw=False):
-    headers = {"Accept": "application/json", "Device-Type": "8"}
+    # vaultwarden only sends ssh keys to clients from 2024.12 on
+    headers = {"Accept": "application/json", "Device-Type": "8", "Bitwarden-Client-Version": "2024.12.0"}
     data = None
     if body is not None:
         if form:
@@ -51,6 +54,14 @@ def enc_raw(data, key):
 split = lambda k: (k[:32], k[32:])
 sync = req("GET", "/api/sync", token=at)
 ukey = split(dec_raw(sync["profile"]["key"], stretched))
+privkey = serialization.load_der_private_key(dec_raw(sync["profile"]["privateKey"], ukey), None)
+oaep = asympad.OAEP(asympad.MGF1(hashes.SHA1()), hashes.SHA1(), None)
+def org_key(org_id):
+    o = next(o for o in sync["profile"]["organizations"] if o["id"] == org_id)
+    ty, ct = o["key"].split(".", 1); assert ty == "4", ty
+    return split(privkey.decrypt(unb64(ct), oaep))
+org_names = {o["id"]: o["name"] for o in sync["profile"]["organizations"]}
+coll_names = {c["id"]: dec_raw(c["name"], org_key(c["organizationId"])).decode() for c in sync.get("collections") or []}
 
 if cmd == "apikey":
     r = req("POST", "/api/accounts/api-key", {"masterPasswordHash": mph}, token=at)
@@ -69,15 +80,35 @@ elif cmd == "mkkeyed":
                       "creationDate": "2026-10-22T00:00:00.000Z"}]},
         "fields": [{"type": 1, "name": e("hk"), "value": e("hv"), "linkedId": None}]}, token=at)
     print("created")
+elif cmd == "mkorg":
+    okey = os.urandom(64); k = split(okey)
+    opriv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub = opriv.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    priv = opriv.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    org = req("POST", "/api/organizations", {
+        "name": sys.argv[5], "billingEmail": email, "planType": 0,
+        "collectionName": enc_raw(sys.argv[6].encode(), k),
+        "key": "4." + b64(privkey.public_key().encrypt(okey, oaep)),
+        "keys": {"publicKey": b64(pub), "encryptedPrivateKey": enc_raw(priv, k)}}, token=at)
+    for name in sys.argv[7:]:
+        req("POST", f"/api/organizations/{org['id']}/collections", {
+            "name": enc_raw(name.encode(), k), "groups": [], "users": []}, token=at)
+    print(org["id"])
 elif cmd == "dump":
     out = []
     for c in sync["ciphers"]:
-        k = split(dec_raw(c["key"], ukey)) if c.get("key") else ukey
+        base = org_key(c["organizationId"]) if c.get("organizationId") else ukey
+        k = split(dec_raw(c["key"], base)) if c.get("key") else base
         d = lambda v: dec_raw(v, k).decode() if v else None
         item = {"name": d(c["name"]), "type": c["type"], "keyed": bool(c.get("key")), "favorite": c.get("favorite"),
                 "deleted": bool(c.get("deletedDate")), "notes": d(c.get("notes")),
                 "fields": [[f["type"], d(f["name"]), d(f["value"])] for f in c.get("fields") or []],
-                "history": [d(h["password"]) for h in c.get("passwordHistory") or []]}
+                "history": [d(h["password"]) for h in c.get("passwordHistory") or []],
+                "archived": bool(c.get("archivedDate")), "org": org_names.get(c.get("organizationId")),
+                "collections": sorted(coll_names.get(i, i) for i in c.get("collectionIds") or [])}
+        for section in ("card", "identity", "sshKey"):
+            if c.get(section):
+                item[section] = {key: d(v) for key, v in c[section].items() if isinstance(v, str)}
         if c.get("login"):
             l = c["login"]
             item["login"] = {"username": d(l.get("username")), "password": d(l.get("password")), "totp": d(l.get("totp")),

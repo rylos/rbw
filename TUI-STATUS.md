@@ -44,15 +44,30 @@ Lock and unlock settings, mirroring the official "Security" page:
 - usage ranking (`src/usage.rs`, ids only): `get`/`code` record,
   `sort_by_usage` sorts `list`/`search`, the tui always uses it.
 
-### TUI (`rbw tui`, `src/bin/rbw/tui.rs`, `settings.rs`)
+### TUI (`rbw tui`, `src/bin/rbw/tui.rs`, `settings.rs`, `views.rs`)
 - fuzzy filter (nucleo), usage first; Enter copies, Tab picks a field,
-  ^U ^T ^R ^O ^E ^N ^D ^S ^L, F1 help, F2 security settings.
+  ^U ^T ^R ^O ^E ^D ^S ^L, F1 help, F2 security settings.
+- sidebar like the official clients (← or Shift-Tab): all items, favorites,
+  types, vaults (personal + organizations), collections, folders, archive,
+  trash (read from the server; Enter restores, ^D deletes for good). Own
+  column from 120 columns, otherwise it covers the list while focused.
+- ^N new item: type (login, card, identity, note, ssh key), vault,
+  collection (organizations), folder, preselected from the view; then the
+  editor (logins start with a generated password, ssh keys are generated
+  with ssh-keygen, ed25519). ^F favorite, ^A archive, ^G generator.
+- sync now keeps favorite, archived, collection ids, organizations (name),
+  collections and folders in the db (`src/api.rs` SyncData); the agent
+  decrypts the keys of organizations joined while unlocked. CLI: `rbw add
+  --type card|identity|note|ssh-key --org NAME --collection NAME`, `rbw
+  archive`, `rbw unarchive`; cards and identities are edited in the editor.
+  `rbw list` (rofi-rbw) still lists archived entries.
 - clipboard cleared by the agent after 30 s; details dropped as soon as
   the agent locks, unlock again before the next key needing a secret.
 - startup ≈ `rbw list` (≈ 40 ms on the real 1681-entry vault).
 
 ### Tests
-- `bash tests/vw/e2e.sh`: 101/101 (polkit faked; tui driven with tmux).
+- `bash tests/vw/e2e.sh`: 135/135 (polkit faked; tui driven with tmux;
+  bwtool.py creates a test organization).
 - `tests/vw/dev-vault.sh`: throwaway vault on :8223 for trying the tui
   (`PATH=target/debug:$PATH RBW_PROFILE=rbwdev rbw tui`).
 - Real polkit + howdy tested on pc-casa with the dev vault: first unlock

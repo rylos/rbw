@@ -13,6 +13,7 @@ mod items;
 mod settings;
 mod sock;
 mod tui;
+mod views;
 
 #[derive(Debug, clap::Args)]
 struct FindArgs {
@@ -396,6 +397,29 @@ enum Opt {
         #[arg(long, help = "Create a secure note instead of a login")]
         secure_note: bool,
         #[arg(
+            long = "type",
+            value_name = "TYPE",
+            conflicts_with = "secure_note",
+            help = "Type of the new entry: login, note, card, identity or \
+                ssh-key (a new ed25519 key is generated)"
+        )]
+        kind: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Create the entry in this organization (needs \
+                --collection)"
+        )]
+        org: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "org",
+            number_of_values = 1,
+            help = "Collection of the organization to put the entry in"
+        )]
+        collection: Vec<String>,
+        #[arg(
             long,
             help = "Don't open the editor, save the entry as given by the \
                 options"
@@ -521,6 +545,24 @@ enum Opt {
         permanent: bool,
     },
 
+    #[command(
+        about = "Archive an entry",
+        long_about = "Archive an entry\n\n\
+            Archived entries are kept, but the official clients and `rbw \
+            tui` show them only in the archive (`rbw list` and rofi-rbw \
+            still list them). `rbw unarchive` brings them back."
+    )]
+    Archive {
+        #[command(flatten)]
+        find_args: FindArgs,
+    },
+
+    #[command(about = "Bring an archived entry back into the vault")]
+    Unarchive {
+        #[command(flatten)]
+        find_args: FindArgs,
+    },
+
     #[command(about = "List the entries in the trash")]
     Trash {
         #[arg(long, help = "Display output as JSON")]
@@ -607,6 +649,8 @@ impl Opt {
             Self::Generate { .. } => "generate".to_string(),
             Self::Edit { .. } => "edit".to_string(),
             Self::Remove { .. } => "remove".to_string(),
+            Self::Archive { .. } => "archive".to_string(),
+            Self::Unarchive { .. } => "unarchive".to_string(),
             Self::Trash { .. } => "trash".to_string(),
             Self::Restore { .. } => "restore".to_string(),
             Self::Folder { .. } => "folder".to_string(),
@@ -763,19 +807,45 @@ fn main() {
             uri,
             folder,
             secure_note,
+            kind,
+            org,
+            collection,
             no_edit,
             attach,
             values,
-        } => items::add(&items::NewItem {
-            name,
-            username: user,
-            uris: uri,
-            folder,
-            secure_note,
-            changes: values.changes(),
-            no_edit,
-            attach,
-        }),
+        } => (|| {
+            let kind = match kind {
+                Some(kind) => items::Kind::parse(&kind).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown type '{kind}' (login, note, card, identity, \
+                         ssh-key)"
+                    )
+                })?,
+                None if secure_note => items::Kind::Note,
+                None => items::Kind::Login,
+            };
+            let (org, collections) = match org {
+                Some(org) => {
+                    let (org, collections) =
+                        items::resolve_collections(&org, &collection)?;
+                    (Some(org), collections)
+                }
+                None => (None, vec![]),
+            };
+            items::add(&items::NewItem {
+                name,
+                username: user,
+                uris: uri,
+                folder,
+                kind,
+                org,
+                collections,
+                password: None,
+                changes: values.changes(),
+                no_edit,
+                attach,
+            })
+        })(),
         Opt::Generate {
             len,
             name,
@@ -849,6 +919,20 @@ fn main() {
             find_args.folder.as_deref(),
             find_args.ignorecase,
             permanent,
+        ),
+        Opt::Archive { find_args } => items::archive(
+            find_args.needle,
+            find_args.user.as_deref(),
+            find_args.folder.as_deref(),
+            find_args.ignorecase,
+            true,
+        ),
+        Opt::Unarchive { find_args } => items::archive(
+            find_args.needle,
+            find_args.user.as_deref(),
+            find_args.folder.as_deref(),
+            find_args.ignorecase,
+            false,
         ),
         Opt::Trash { raw } => items::trash(raw),
         Opt::Restore { needle } => items::restore(&needle),

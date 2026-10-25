@@ -400,6 +400,31 @@ struct SyncRes {
     profile: SyncResProfile,
     #[serde(rename = "Folders", alias = "folders")]
     folders: Vec<SyncResFolder>,
+    #[serde(rename = "Collections", alias = "collections", default)]
+    collections: Vec<SyncResCollection>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct SyncResCollection {
+    #[serde(rename = "Id", alias = "id")]
+    id: String,
+    #[serde(rename = "OrganizationId", alias = "organizationId")]
+    organization_id: String,
+    #[serde(rename = "Name", alias = "name")]
+    name: String,
+    #[serde(rename = "ReadOnly", alias = "readOnly", default)]
+    read_only: bool,
+}
+
+// everything a sync stores in the db
+pub struct SyncData {
+    pub protected_key: String,
+    pub protected_private_key: String,
+    pub protected_org_keys: std::collections::HashMap<String, String>,
+    pub entries: Vec<crate::db::Entry>,
+    pub organizations: Vec<crate::db::Organization>,
+    pub collections: Vec<crate::db::Collection>,
+    pub folders: Vec<crate::db::Folder>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -436,6 +461,12 @@ struct SyncResCipher {
     reprompt: CipherRepromptType,
     #[serde(rename = "Attachments", alias = "attachments", default)]
     attachments: Option<Vec<SyncResAttachment>>,
+    #[serde(rename = "Favorite", alias = "favorite", default)]
+    favorite: bool,
+    #[serde(rename = "ArchivedDate", alias = "archivedDate", default)]
+    archived_date: Option<String>,
+    #[serde(rename = "CollectionIds", alias = "collectionIds", default)]
+    collection_ids: Option<Vec<String>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -594,6 +625,9 @@ impl SyncResCipher {
                         .collect()
                 },
             ),
+            favorite: self.favorite,
+            archived: self.archived_date.is_some(),
+            collection_ids: self.collection_ids.clone().unwrap_or_default(),
         })
     }
 }
@@ -614,6 +648,8 @@ struct SyncResProfileOrganization {
     id: String,
     #[serde(rename = "Key", alias = "key")]
     key: String,
+    #[serde(rename = "Name", alias = "name", default)]
+    name: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -1244,15 +1280,7 @@ impl Client {
         Ok((sso_code, sso_code_verifier, callback_url))
     }
 
-    pub async fn sync(
-        &self,
-        access_token: &str,
-    ) -> Result<(
-        String,
-        String,
-        std::collections::HashMap<String, String>,
-        Vec<crate::db::Entry>,
-    )> {
+    pub async fn sync(&self, access_token: &str) -> Result<SyncData> {
         let client = self.reqwest_client().await?;
         let res = client
             .get(self.api_url("/sync"))
@@ -1277,12 +1305,41 @@ impl Client {
                     .iter()
                     .map(|org| (org.id.clone(), org.key.clone()))
                     .collect();
-                Ok((
-                    sync_res.profile.key,
-                    sync_res.profile.private_key,
-                    org_keys,
-                    ciphers,
-                ))
+                let organizations = sync_res
+                    .profile
+                    .organizations
+                    .iter()
+                    .map(|org| crate::db::Organization {
+                        id: org.id.clone(),
+                        name: org.name.clone().unwrap_or_default(),
+                    })
+                    .collect();
+                let collections = sync_res
+                    .collections
+                    .iter()
+                    .map(|c| crate::db::Collection {
+                        id: c.id.clone(),
+                        org_id: c.organization_id.clone(),
+                        name: c.name.clone(),
+                        read_only: c.read_only,
+                    })
+                    .collect();
+                let folders = folders
+                    .iter()
+                    .map(|f| crate::db::Folder {
+                        id: f.id.clone(),
+                        name: f.name.clone(),
+                    })
+                    .collect();
+                Ok(SyncData {
+                    protected_key: sync_res.profile.key,
+                    protected_private_key: sync_res.profile.private_key,
+                    protected_org_keys: org_keys,
+                    entries: ciphers,
+                    organizations,
+                    collections,
+                    folders,
+                })
             }
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
@@ -1418,6 +1475,42 @@ impl Client {
             .send()
             .map_err(|source| Error::Reqwest { source })?;
         check_response(res)?.json_with_path()
+    }
+
+    // an organization item is created together with the collections it
+    // belongs to
+    pub fn create_org_cipher(
+        &self,
+        access_token: &str,
+        cipher: &serde_json::Value,
+        collection_ids: &[String],
+    ) -> Result<serde_json::Value> {
+        let res = reqwest::blocking::Client::new()
+            .post(self.api_url("/ciphers/create"))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(&serde_json::json!({
+                "cipher": cipher,
+                "collectionIds": collection_ids,
+            }))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?.json_with_path()
+    }
+
+    pub fn archive_cipher(
+        &self,
+        access_token: &str,
+        id: &str,
+        archived: bool,
+    ) -> Result<()> {
+        let action = if archived { "archive" } else { "unarchive" };
+        let res = reqwest::blocking::Client::new()
+            .put(self.api_url(&format!("/ciphers/{id}/{action}")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        check_response(res)?;
+        Ok(())
     }
 
     pub fn update_cipher(

@@ -1662,7 +1662,10 @@ pub fn generate(
             username: username.map(std::string::ToString::to_string),
             uris: uris.iter().map(|(uri, _)| uri.clone()).collect(),
             folder: folder.map(std::string::ToString::to_string),
-            secure_note: false,
+            kind: crate::items::Kind::Login,
+            org: None,
+            collections: vec![],
+            password: None,
             changes: crate::items::Changes {
                 password: Some(password),
                 ..crate::items::Changes::default()
@@ -3811,6 +3814,82 @@ pub struct TuiEntry {
     pub kind: &'static str,
     pub reprompt: bool,
     pub attachments: usize,
+    pub org_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub collection_ids: Vec<String>,
+    pub favorite: bool,
+    pub archived: bool,
+    // items in the trash only: when they were deleted
+    pub deleted: Option<String>,
+}
+
+pub struct TuiCollection {
+    pub id: String,
+    pub org_id: String,
+    pub name: String,
+    pub read_only: bool,
+}
+
+// the organizations, collections and folders, with their names decrypted
+// and sorted like the official clients do
+pub struct TuiVault {
+    pub organizations: Vec<(String, String)>,
+    pub collections: Vec<TuiCollection>,
+    pub folders: Vec<(String, String)>,
+}
+
+pub fn tui_vault(db: &rbw::db::Db) -> anyhow::Result<TuiVault> {
+    let mut items = vec![];
+    for c in &db.collections {
+        items.push(rbw::protocol::DecryptItem {
+            cipherstring: c.name.clone(),
+            entry_key: None,
+            org_id: Some(c.org_id.clone()),
+        });
+    }
+    for f in &db.folders {
+        items.push(rbw::protocol::DecryptItem {
+            cipherstring: f.name.clone(),
+            entry_key: None,
+            org_id: None,
+        });
+    }
+    let mut names = if items.is_empty() {
+        vec![]
+    } else {
+        crate::actions::decrypt_many(items)?
+    }
+    .into_iter()
+    .map(|res| res.unwrap_or_else(|e| format!("<undecryptable: {e}>")));
+    let mut collections: Vec<TuiCollection> = db
+        .collections
+        .iter()
+        .map(|c| TuiCollection {
+            id: c.id.clone(),
+            org_id: c.org_id.clone(),
+            name: names.next().unwrap_or_default(),
+            read_only: c.read_only,
+        })
+        .collect();
+    let mut folders: Vec<(String, String)> = db
+        .folders
+        .iter()
+        .map(|f| (f.id.clone(), names.next().unwrap_or_default()))
+        .collect();
+    let mut organizations: Vec<(String, String)> = db
+        .organizations
+        .iter()
+        .map(|o| (o.id.clone(), o.name.clone()))
+        .collect();
+    let key = |s: &str| s.to_lowercase();
+    collections.sort_by_key(|c| key(&c.name));
+    folders.sort_by_key(|(_, name)| key(name));
+    organizations.sort_by_key(|(_, name)| key(name));
+    Ok(TuiVault {
+        organizations,
+        collections,
+        folders,
+    })
 }
 
 pub fn tui_entries(db: &rbw::db::Db) -> anyhow::Result<Vec<TuiEntry>> {
@@ -3842,6 +3921,12 @@ pub fn tui_entries(db: &rbw::db::Db) -> anyhow::Result<Vec<TuiEntry>> {
             },
             reprompt: entry.master_password_reprompt(),
             attachments: entry.attachments.len(),
+            org_id: entry.org_id.clone(),
+            folder_id: entry.folder_id.clone(),
+            collection_ids: entry.collection_ids.clone(),
+            favorite: entry.favorite,
+            archived: entry.archived,
+            deleted: None,
         })
         .collect())
 }
@@ -5433,6 +5518,9 @@ mod test {
             key: Some("entry key".to_string()),
             master_password_reprompt: rbw::api::CipherRepromptType::None,
             attachments: vec![],
+            favorite: false,
+            archived: false,
+            collection_ids: vec![],
         };
         let entries = vec![entry.clone(), entry];
 
@@ -5487,6 +5575,9 @@ mod test {
                 key: None,
                 master_password_reprompt: rbw::api::CipherRepromptType::None,
                 attachments: vec![],
+                favorite: false,
+                archived: false,
+                collection_ids: vec![],
             },
             DecryptedSearchCipher {
                 id: id.to_string(),

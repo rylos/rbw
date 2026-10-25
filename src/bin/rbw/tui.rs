@@ -4,6 +4,7 @@
 // secrets); the selected entry is decrypted on demand, except for entries
 // with master password reprompt, which wait for an explicit Enter. Copies go
 // through the agent, which clears the clipboard after CLIPBOARD_SECONDS.
+// The sidebar (views.rs) narrows the list like the official clients do.
 
 use std::io::IsTerminal as _;
 
@@ -19,7 +20,8 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use crate::commands::{TuiDetails, TuiEntry};
+use crate::commands::{TuiDetails, TuiEntry, TuiVault};
+use crate::views::{Row, View};
 
 const CLIPBOARD_SECONDS: u64 = 30;
 const MESSAGE_SECONDS: u64 = 4;
@@ -27,11 +29,24 @@ const MESSAGE_SECONDS: u64 = 4;
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
+// the sidebar gets its own column from this width on, below it covers the
+// list while it has the focus
+const SIDEBAR_WIDTH: u16 = 120;
+
+const GENERATOR_TYPES: [(rbw::pwgen::Type, &str); 5] = [
+    (rbw::pwgen::Type::AllChars, "letters, digits and symbols"),
+    (rbw::pwgen::Type::NoSymbols, "letters and digits"),
+    (rbw::pwgen::Type::NonConfusables, "no look-alike characters"),
+    (rbw::pwgen::Type::Numbers, "digits only"),
+    (rbw::pwgen::Type::Diceware, "passphrase"),
+];
+
 type Term =
     ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 #[derive(PartialEq, Eq)]
 enum Focus {
+    Sidebar,
     List,
     Details,
 }
@@ -39,14 +54,71 @@ enum Focus {
 enum Mode {
     Normal,
     ConfirmTrash(String),
+    ConfirmPurge(String),
     Help,
     // the selected row
     Settings(usize),
+    New(NewForm),
+    Generator,
+}
+
+// the choices of a new item before the editor opens
+#[derive(Clone, Copy, Default)]
+struct NewForm {
+    row: usize,
+    kind: usize,
+    // 0 is the personal vault, then the organizations in TuiVault order
+    vault: usize,
+    // among the writable collections of the chosen organization
+    collection: usize,
+    // 0 is no folder
+    folder: usize,
+}
+
+struct Generator {
+    ty: usize,
+    len: usize,
+    words: usize,
+    value: String,
+}
+
+impl Generator {
+    fn new() -> Self {
+        let mut g = Self {
+            ty: 0,
+            len: 20,
+            words: 5,
+            value: String::new(),
+        };
+        g.generate();
+        g
+    }
+
+    fn diceware(&self) -> bool {
+        GENERATOR_TYPES[self.ty].0 == rbw::pwgen::Type::Diceware
+    }
+
+    fn generate(&mut self) {
+        let len = if self.diceware() {
+            self.words
+        } else {
+            self.len
+        };
+        self.value = rbw::pwgen::pwgen(GENERATOR_TYPES[self.ty].0, len);
+    }
 }
 
 struct App {
     db: rbw::db::Db,
     entries: Vec<TuiEntry>,
+    vault: TuiVault,
+    rows: Vec<Row>,
+    view: View,
+    // the selected row of the sidebar
+    sidebar: ListState,
+    // read from the server when the trash is opened
+    trash: Vec<TuiEntry>,
+    generator: Generator,
     usage: rbw::usage::Usage,
     matcher: nucleo_matcher::Matcher,
     query: String,
@@ -120,9 +192,17 @@ impl App {
     fn load() -> anyhow::Result<Self> {
         let db = crate::commands::load_db()?;
         let entries = crate::commands::tui_entries(&db)?;
+        let vault = crate::commands::tui_vault(&db)?;
+        let rows = crate::views::rows(&vault, &entries);
         let mut app = Self {
             db,
             entries,
+            vault,
+            rows,
+            view: View::All,
+            sidebar: ListState::default().with_selected(Some(0)),
+            trash: vec![],
+            generator: Generator::new(),
             usage: rbw::usage::Usage::load(),
             matcher: nucleo_matcher::Matcher::new(
                 nucleo_matcher::Config::DEFAULT,
@@ -151,24 +231,111 @@ impl App {
         let selected = self.selected().map(|e| e.id.clone());
         self.db = crate::commands::load_db()?;
         self.entries = crate::commands::tui_entries(&self.db)?;
+        self.vault = crate::commands::tui_vault(&self.db)?;
+        self.rows = crate::views::rows(&self.vault, &self.entries);
+        // a folder or collection that is gone
+        let pos = self.rows.iter().position(
+            |row| matches!(row, Row::View { view, .. } if *view == self.view),
+        );
+        if pos.is_none() {
+            self.view = View::All;
+        }
+        self.sidebar.select(Some(pos.unwrap_or(0)));
+        if self.view == View::Trash {
+            self.load_trash();
+        }
         self.details.clear();
         self.last_sync = db_mtime();
         self.refilter();
         if let Some(id) = selected {
             if let Some(pos) =
-                self.filtered.iter().position(|&i| self.entries[i].id == id)
+                self.filtered.iter().position(|&i| self.pool()[i].id == id)
             {
                 self.list.select(Some(pos));
+                self.on_select();
             }
         }
         Ok(())
+    }
+
+    // what the list shows: the vault, or the trash
+    fn pool(&self) -> &[TuiEntry] {
+        if self.view == View::Trash {
+            &self.trash
+        } else {
+            &self.entries
+        }
     }
 
     fn selected(&self) -> Option<&TuiEntry> {
         self.list
             .selected()
             .and_then(|i| self.filtered.get(i))
-            .map(|&i| &self.entries[i])
+            .map(|&i| &self.pool()[i])
+    }
+
+    fn load_trash(&mut self) {
+        match crate::items::trashed() {
+            Ok(items) => {
+                self.trash = items
+                    .into_iter()
+                    .map(|(id, name, deleted)| TuiEntry {
+                        id,
+                        name,
+                        user: None,
+                        folder: None,
+                        uris: vec![],
+                        kind: "deleted",
+                        reprompt: false,
+                        attachments: 0,
+                        org_id: None,
+                        folder_id: None,
+                        collection_ids: vec![],
+                        favorite: false,
+                        archived: false,
+                        deleted: Some(deleted),
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                self.trash.clear();
+                self.message(format!("{e:#}"), true);
+            }
+        }
+    }
+
+    fn set_view(&mut self, view: View) {
+        if view == self.view {
+            return;
+        }
+        self.view = view;
+        if self.view == View::Trash {
+            self.load_trash();
+        }
+        self.refilter();
+    }
+
+    // moves the sidebar selection over the views, skipping the headers, and
+    // shows the view right away
+    fn sidebar_move(&mut self, delta: isize) {
+        let selectable: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, Row::View { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(last) = selectable.len().checked_sub(1) else {
+            return;
+        };
+        let cur = self.sidebar.selected().unwrap_or(0);
+        let at = selectable.iter().position(|&i| i >= cur).unwrap_or(0);
+        let next = selectable[at.saturating_add_signed(delta).min(last)];
+        self.sidebar.select(Some(next));
+        if let Some(Row::View { view, .. }) = self.rows.get(next) {
+            let view = view.clone();
+            self.set_view(view);
+        }
     }
 
     fn haystack(entry: &TuiEntry) -> String {
@@ -190,9 +357,18 @@ impl App {
         // better match
         let bonus =
             |e: &TuiEntry| (usage.score(&e.id).ln_1p() * 8.0).min(40.0);
+        let pool = if self.view == View::Trash {
+            &self.trash
+        } else {
+            &self.entries
+        };
+        let view = &self.view;
+        let visible = |e: &TuiEntry| *view == View::Trash || view.matches(e);
         let mut scored: Vec<(f64, usize)> = if self.query.trim().is_empty() {
-            (0..self.entries.len())
-                .map(|i| (bonus(&self.entries[i]), i))
+            pool.iter()
+                .enumerate()
+                .filter(|(_, e)| visible(e))
+                .map(|(i, e)| (bonus(e), i))
                 .collect()
         } else {
             let pattern = nucleo_matcher::pattern::Pattern::parse(
@@ -201,9 +377,9 @@ impl App {
                 nucleo_matcher::pattern::Normalization::Smart,
             );
             let mut buf = vec![];
-            self.entries
-                .iter()
+            pool.iter()
                 .enumerate()
+                .filter(|(_, e)| visible(e))
                 .filter_map(|(i, e)| {
                     let hay = Self::haystack(e);
                     let hay = nucleo_matcher::Utf32Str::new(&hay, &mut buf);
@@ -213,7 +389,7 @@ impl App {
                 })
                 .collect()
         };
-        let entries = &self.entries;
+        let entries = pool;
         scored.sort_by(|(a, i), (b, j)| {
             b.total_cmp(a).then_with(|| {
                 entries[*i]
@@ -231,9 +407,14 @@ impl App {
         self.detail_error = None;
         self.detail_line = 0;
         self.reveal = false;
-        self.focus = Focus::List;
+        if self.focus == Focus::Details {
+            self.focus = Focus::List;
+        }
         if let Some(entry) = self.selected() {
-            if !entry.reprompt && !self.details.contains_key(&entry.id) {
+            if !entry.reprompt
+                && entry.deleted.is_none()
+                && !self.details.contains_key(&entry.id)
+            {
                 let id = entry.id.clone();
                 self.fetch_details(&id);
             }
@@ -336,7 +517,11 @@ impl App {
     // the details of the selection, decrypting them first when needed (an
     // entry with reprompt asks for the master password here)
     fn ensure_details(&mut self) -> Option<TuiDetails> {
-        let id = self.selected()?.id.clone();
+        let entry = self.selected()?;
+        if entry.deleted.is_some() {
+            return None;
+        }
+        let id = entry.id.clone();
         if !self.details.contains_key(&id) {
             self.fetch_details(&id);
         }
@@ -347,6 +532,18 @@ impl App {
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Help => return Outcome::None,
             Mode::Settings(row) => return self.settings_key(key, row),
+            Mode::New(form) => return self.new_key(key, form),
+            Mode::Generator => return self.generator_key(key),
+            Mode::ConfirmPurge(id) => {
+                if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                    return inline(self, move || {
+                        crate::items::purge_id(&id)?;
+                        Ok("deleted for good".to_string())
+                    });
+                }
+                self.message("not deleted", false);
+                return Outcome::None;
+            }
             Mode::ConfirmTrash(id) => {
                 if matches!(key.code, KeyCode::Char('y' | 'Y')) {
                     return Outcome::Suspend(Box::new(move || {
@@ -368,6 +565,61 @@ impl App {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        if self.focus == Focus::Sidebar {
+            match key.code {
+                KeyCode::Up => self.sidebar_move(-1),
+                KeyCode::Down => self.sidebar_move(1),
+                KeyCode::Char('p' | 'k') if ctrl => self.sidebar_move(-1),
+                KeyCode::Char('j') if ctrl => self.sidebar_move(1),
+                KeyCode::PageUp => self.sidebar_move(-10),
+                KeyCode::PageDown => self.sidebar_move(10),
+                KeyCode::Home => self.sidebar_move(-1000),
+                KeyCode::End => self.sidebar_move(1000),
+                KeyCode::Enter
+                | KeyCode::Right
+                | KeyCode::Tab
+                | KeyCode::Esc
+                | KeyCode::Left
+                | KeyCode::BackTab => self.focus = Focus::List,
+                _ => {
+                    // anything else works as in the list (typing filters)
+                    self.focus = Focus::List;
+                    return self.handle_key(key);
+                }
+            }
+            return Outcome::None;
+        }
+
+        if self.view == View::Trash && self.focus == Focus::List {
+            match key.code {
+                KeyCode::Enter => {
+                    let Some(entry) = self.selected() else {
+                        return Outcome::None;
+                    };
+                    let id = entry.id.clone();
+                    return inline(self, move || {
+                        crate::items::restore_id(&id)?;
+                        Ok("restored".to_string())
+                    });
+                }
+                KeyCode::Char('d') if ctrl => {
+                    if let Some(entry) = self.selected() {
+                        self.mode = Mode::ConfirmPurge(entry.id.clone());
+                    }
+                    return Outcome::None;
+                }
+                KeyCode::Char('u' | 't' | 'o' | 'e' | 'f' | 'a' | 'r')
+                    if ctrl =>
+                {
+                    self.message("restore it first (Enter)", true);
+                    return Outcome::None;
+                }
+                KeyCode::Tab | KeyCode::Right => return Outcome::None,
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('c' | 'q') if ctrl => self.quit = true,
             KeyCode::Esc => {
@@ -393,6 +645,9 @@ impl App {
             KeyCode::End if self.focus == Focus::List => {
                 self.list.select(self.filtered.len().checked_sub(1));
                 self.on_select();
+            }
+            KeyCode::Left | KeyCode::BackTab if self.focus == Focus::List => {
+                self.focus = Focus::Sidebar;
             }
             KeyCode::Tab | KeyCode::Right if self.focus == Focus::List => {
                 if self.ensure_details().is_some() {
@@ -475,20 +730,35 @@ impl App {
                 }
             }
             KeyCode::Char('n') if ctrl => {
-                let name = self.query.trim().to_string();
-                return Outcome::Suspend(Box::new(move || {
-                    crate::items::add(&crate::items::NewItem {
-                        name,
-                        username: None,
-                        uris: vec![],
-                        folder: None,
-                        secure_note: false,
-                        changes: crate::items::Changes::default(),
-                        no_edit: false,
-                        attach: vec![],
-                    })?;
-                    Ok("added".to_string())
-                }));
+                self.mode = Mode::New(self.new_form());
+            }
+            KeyCode::Char('g') if ctrl => {
+                self.generator.generate();
+                self.mode = Mode::Generator;
+            }
+            KeyCode::Char('f') if ctrl => {
+                if let Some(entry) = self.selected() {
+                    let (id, favorite) = (entry.id.clone(), !entry.favorite);
+                    return inline(self, move || {
+                        crate::items::set_favorite(&id, favorite)?;
+                        Ok(if favorite {
+                            "added to the favorites"
+                        } else {
+                            "removed from the favorites"
+                        }
+                        .to_string())
+                    });
+                }
+            }
+            KeyCode::Char('a') if ctrl => {
+                if let Some(entry) = self.selected() {
+                    let (id, archive) = (entry.id.clone(), !entry.archived);
+                    return inline(self, move || {
+                        crate::items::set_archived(&id, archive)?;
+                        Ok(if archive { "archived" } else { "unarchived" }
+                            .to_string())
+                    });
+                }
             }
             KeyCode::Char('d') if ctrl => {
                 if let Some(entry) = self.selected() {
@@ -597,6 +867,246 @@ impl App {
         Ok(())
     }
 
+    // the new item starts from the view: its type, vault, collection or
+    // folder
+    fn new_form(&self) -> NewForm {
+        let mut form = NewForm::default();
+        match &self.view {
+            View::Kind(kind) => {
+                form.kind = crate::views::KINDS
+                    .iter()
+                    .position(|(k, _)| k == kind)
+                    .unwrap_or(0);
+            }
+            View::Org(id) => {
+                form.vault = self.org_index(id);
+            }
+            View::Collection(id) => {
+                if let Some(c) =
+                    self.vault.collections.iter().find(|c| &c.id == id)
+                {
+                    form.vault = self.org_index(&c.org_id);
+                    form.collection = self
+                        .writable_collections(form.vault)
+                        .iter()
+                        .position(|w| w.id == *id)
+                        .unwrap_or(0);
+                }
+            }
+            View::Folder(Some(id)) => {
+                form.folder = self
+                    .vault
+                    .folders
+                    .iter()
+                    .position(|(f, _)| f == id)
+                    .map_or(0, |i| i + 1);
+            }
+            _ => {}
+        }
+        form
+    }
+
+    fn org_index(&self, org_id: &str) -> usize {
+        self.vault
+            .organizations
+            .iter()
+            .position(|(id, _)| id == org_id)
+            .map_or(0, |i| i + 1)
+    }
+
+    fn writable_collections(
+        &self,
+        vault: usize,
+    ) -> Vec<&crate::commands::TuiCollection> {
+        let Some((org, _)) = vault
+            .checked_sub(1)
+            .and_then(|i| self.vault.organizations.get(i))
+        else {
+            return vec![];
+        };
+        self.vault
+            .collections
+            .iter()
+            .filter(|c| &c.org_id == org && !c.read_only)
+            .collect()
+    }
+
+    // the rows of the new item popup: type, vault (when there are
+    // organizations), collection (for an organization), folder
+    fn new_rows(&self, form: &NewForm) -> Vec<usize> {
+        let mut rows = vec![0];
+        if !self.vault.organizations.is_empty() {
+            rows.push(1);
+            if form.vault > 0 {
+                rows.push(2);
+            }
+        }
+        rows.push(3);
+        rows
+    }
+
+    fn new_key(&mut self, key: KeyEvent, mut form: NewForm) -> Outcome {
+        let rows = self.new_rows(&form);
+        let at = rows.iter().position(|&r| r == form.row).unwrap_or(0);
+        // step is -1 or 1
+        let cycle = |value: usize, n: usize, step: isize| {
+            if n == 0 {
+                0
+            } else if step < 0 {
+                (value + n - 1) % n
+            } else {
+                (value + 1) % n
+            }
+        };
+        let step = match key.code {
+            KeyCode::Esc => {
+                self.message("nothing created", false);
+                return Outcome::None;
+            }
+            KeyCode::Enter => return self.create(form),
+            KeyCode::Up | KeyCode::BackTab => {
+                form.row = rows[at.saturating_sub(1)];
+                0
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.row = rows[(at + 1).min(rows.len() - 1)];
+                0
+            }
+            KeyCode::Left => -1,
+            KeyCode::Right | KeyCode::Char(' ') => 1,
+            _ => 0,
+        };
+        if step != 0 {
+            match form.row {
+                0 => {
+                    form.kind =
+                        cycle(form.kind, crate::views::KINDS.len(), step);
+                }
+                1 => {
+                    form.vault = cycle(
+                        form.vault,
+                        self.vault.organizations.len() + 1,
+                        step,
+                    );
+                    form.collection = 0;
+                }
+                2 => {
+                    form.collection = cycle(
+                        form.collection,
+                        self.writable_collections(form.vault).len(),
+                        step,
+                    );
+                }
+                _ => {
+                    form.folder = cycle(
+                        form.folder,
+                        self.vault.folders.len() + 1,
+                        step,
+                    );
+                }
+            }
+        }
+        self.mode = Mode::New(form);
+        Outcome::None
+    }
+
+    fn create(&mut self, form: NewForm) -> Outcome {
+        let kind = crate::items::Kind::ALL[form.kind];
+        let org = form
+            .vault
+            .checked_sub(1)
+            .and_then(|i| self.vault.organizations.get(i))
+            .map(|(id, _)| id.clone());
+        let collections: Vec<String> = self
+            .writable_collections(form.vault)
+            .get(form.collection)
+            .map(|c| c.id.clone())
+            .into_iter()
+            .collect();
+        if org.is_some() && collections.is_empty() {
+            self.message(
+                "this organization has no collection you can write to",
+                true,
+            );
+            return Outcome::None;
+        }
+        let folder = form
+            .folder
+            .checked_sub(1)
+            .and_then(|i| self.vault.folders.get(i))
+            .map(|(_, name)| name.clone());
+        let password = (kind == crate::items::Kind::Login).then(|| {
+            self.generator.generate();
+            self.generator.value.clone()
+        });
+        let name = self.query.trim().to_string();
+        Outcome::Suspend(Box::new(move || {
+            crate::items::add(&crate::items::NewItem {
+                name,
+                username: None,
+                uris: vec![],
+                folder,
+                kind,
+                org,
+                collections,
+                password,
+                changes: crate::items::Changes::default(),
+                no_edit: false,
+                attach: vec![],
+            })?;
+            Ok("added".to_string())
+        }))
+    }
+
+    fn generator_key(&mut self, key: KeyEvent) -> Outcome {
+        let g = &mut self.generator;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Outcome::None,
+            KeyCode::Enter | KeyCode::Char('c') => {
+                let value = g.value.clone();
+                match crate::actions::clipboard_store_for(
+                    &value,
+                    CLIPBOARD_SECONDS,
+                ) {
+                    Ok(()) => self.message(
+                        format!(
+                            "generated password copied, cleared in \
+                             {CLIPBOARD_SECONDS}s"
+                        ),
+                        false,
+                    ),
+                    Err(e) => self.message(format!("{e:#}"), true),
+                }
+                return Outcome::None;
+            }
+            KeyCode::Left | KeyCode::Char('-') => {
+                if g.diceware() {
+                    g.words = g.words.saturating_sub(1).max(3);
+                } else {
+                    g.len = g.len.saturating_sub(1).max(5);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('+') => {
+                if g.diceware() {
+                    g.words = (g.words + 1).min(20);
+                } else {
+                    g.len = (g.len + 1).min(128);
+                }
+            }
+            KeyCode::Up => {
+                g.ty = (g.ty + GENERATOR_TYPES.len() - 1)
+                    % GENERATOR_TYPES.len();
+            }
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char(' ') => {
+                g.ty = (g.ty + 1) % GENERATOR_TYPES.len();
+            }
+            _ => {}
+        }
+        g.generate();
+        self.mode = Mode::Generator;
+        Outcome::None
+    }
+
     fn settings_key(&mut self, key: KeyEvent, row: usize) -> Outcome {
         let step = match key.code {
             KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
@@ -642,7 +1152,9 @@ impl App {
             .is_none_or(|status| status.locked);
         if locked && !self.locked {
             self.details.clear();
-            self.focus = Focus::List;
+            if self.focus == Focus::Details {
+                self.focus = Focus::List;
+            }
             self.reveal = false;
         }
         self.locked = locked;
@@ -661,6 +1173,15 @@ impl App {
 
         self.draw_input(f, rows[0]);
 
+        let mut body = rows[1];
+        if area.width >= SIDEBAR_WIDTH {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(28), Constraint::Min(10)])
+                .split(body);
+            self.draw_sidebar(f, cols[0]);
+            body = cols[1];
+        }
         let wide = area.width >= 90;
         let panes = Layout::default()
             .direction(if wide {
@@ -673,14 +1194,38 @@ impl App {
             } else {
                 [Constraint::Percentage(55), Constraint::Percentage(45)]
             })
-            .split(rows[1]);
-        self.draw_list(f, panes[0]);
+            .split(body);
+        if area.width < SIDEBAR_WIDTH && self.focus == Focus::Sidebar {
+            self.draw_sidebar(f, panes[0]);
+        } else {
+            self.draw_list(f, panes[0]);
+        }
         self.draw_details(f, panes[1]);
         self.draw_footer(f, rows[2]);
 
         match &self.mode {
             Mode::Help => draw_help(f, area),
             Mode::Settings(row) => draw_settings(f, area, *row),
+            Mode::New(form) => self.draw_new(f, area, form),
+            Mode::Generator => self.draw_generator(f, area),
+            Mode::ConfirmPurge(_) => {
+                let name = self.selected().map_or("", |e| e.name.as_str());
+                draw_popup(
+                    f,
+                    area,
+                    "Delete for good",
+                    vec![
+                        Line::from(format!(
+                            "Delete {name} for good? It can't be restored."
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            "y".bold().fg(ACCENT),
+                            " yes   any other key: no".into(),
+                        ]),
+                    ],
+                );
+            }
             Mode::ConfirmTrash(_) => {
                 let name = self.selected().map_or("", |e| e.name.as_str());
                 draw_popup(
@@ -703,7 +1248,7 @@ impl App {
 
     fn draw_input(&self, f: &mut ratatui::Frame, area: Rect) {
         let count =
-            format!(" {}/{} ", self.filtered.len(), self.entries.len());
+            format!(" {}/{} ", self.filtered.len(), self.pool().len());
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -727,12 +1272,26 @@ impl App {
 
     fn draw_list(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let width = usize::from(area.width.saturating_sub(4));
+        let pool = self.pool();
         let items: Vec<ListItem> = self
             .filtered
             .iter()
             .map(|&i| {
-                let e = &self.entries[i];
-                let mut spans = vec![Span::raw(e.name.clone())];
+                let e = &pool[i];
+                let mut spans = vec![];
+                if e.favorite {
+                    spans.push(Span::styled(
+                        "★ ",
+                        Style::new().fg(Color::Yellow),
+                    ));
+                }
+                spans.push(Span::raw(e.name.clone()));
+                if let Some(deleted) = &e.deleted {
+                    spans.push(Span::styled(
+                        format!("  deleted {}", day(deleted)),
+                        Style::new().fg(DIM),
+                    ));
+                }
                 if let Some(user) = &e.user {
                     spans.push(Span::styled(
                         format!("  {user}"),
@@ -760,13 +1319,9 @@ impl App {
         } else {
             DIM
         };
+        let title = self.view.label(&self.vault);
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().fg(border)),
-            )
+            .block(pane(border, &title))
             .highlight_style(
                 Style::new()
                     .bg(Color::Indexed(236))
@@ -790,12 +1345,46 @@ impl App {
             return;
         };
         let mut lines = vec![];
-        let mut meta = vec![Span::styled(entry.kind, Style::new().fg(DIM))];
+        if let Some(deleted) = &entry.deleted {
+            lines.push(Line::from(Span::styled(
+                format!("in the trash since {}", day(deleted)),
+                Style::new().fg(DIM),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                "Enter".bold().fg(ACCENT),
+                " restores   ".into(),
+                "^D".bold().fg(ACCENT),
+                " deletes it for good".into(),
+            ]));
+            f.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .wrap(Wrap { trim: false })
+                    .block(pane(border, &entry.name)),
+                area,
+            );
+            return;
+        }
+        let mut meta = vec![];
+        if entry.favorite {
+            meta.push(Span::styled("★ ", Style::new().fg(Color::Yellow)));
+        }
+        meta.push(Span::styled(entry.kind, Style::new().fg(DIM)));
+        if let Some(org) = &entry.org_id {
+            let name = View::Org(org.clone()).label(&self.vault);
+            meta.push(Span::styled(
+                format!(" · {name}"),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
         if let Some(folder) = &entry.folder {
             meta.push(Span::styled(
                 format!(" · {folder}"),
                 Style::new().fg(Color::Blue),
             ));
+        }
+        if entry.archived {
+            meta.push(Span::styled(" · archived", Style::new().fg(DIM)));
         }
         if entry.attachments > 0 {
             meta.push(Span::styled(
@@ -804,6 +1393,17 @@ impl App {
             ));
         }
         lines.push(Line::from(meta));
+        let collections: Vec<String> = entry
+            .collection_ids
+            .iter()
+            .map(|id| View::Collection(id.clone()).label(&self.vault))
+            .collect();
+        if !collections.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("collections: {}", collections.join(", ")),
+                Style::new().fg(DIM),
+            )));
+        }
         lines.push(Line::from(""));
 
         if let Some(details) = self.details.get(&entry.id) {
@@ -940,11 +1540,20 @@ impl App {
                 return;
             }
         }
-        let keys: &[(&str, &str)] = if self.focus == Focus::Details {
+        let keys: &[(&str, &str)] = if self.focus == Focus::Sidebar {
+            &[("↑↓", "view"), ("↵/→", "list"), ("F1", "help")]
+        } else if self.focus == Focus::Details {
             &[
                 ("↵", "copy"),
                 ("^R", "reveal"),
                 ("⇥/Esc", "back"),
+                ("F1", "help"),
+            ]
+        } else if self.view == View::Trash {
+            &[
+                ("↵", "restore"),
+                ("^D", "delete for good"),
+                ("←", "views"),
                 ("F1", "help"),
             ]
         } else {
@@ -952,12 +1561,12 @@ impl App {
                 ("↵", "copy"),
                 ("^U", "user"),
                 ("^T", "totp"),
-                ("^O", "open"),
                 ("⇥", "fields"),
+                ("←", "views"),
                 ("^E", "edit"),
                 ("^N", "new"),
+                ("^G", "generate"),
                 ("F1", "help"),
-                ("F2", "security"),
             ]
         };
         let mut spans = vec![];
@@ -987,11 +1596,219 @@ impl App {
     }
 }
 
+impl App {
+    fn draw_sidebar(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        let width = usize::from(area.width.saturating_sub(4));
+        let items: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|row| match row {
+                Row::Header(title) => {
+                    ListItem::new(Line::from(Span::styled(
+                        (*title).to_string(),
+                        Style::new().fg(DIM).bold(),
+                    )))
+                }
+                Row::View { view, label, count } => {
+                    let style = if *view == self.view {
+                        Style::new().fg(ACCENT).bold()
+                    } else {
+                        Style::new()
+                    };
+                    let count =
+                        count.map_or_else(String::new, |c| c.to_string());
+                    let label = truncate(
+                        label,
+                        width.saturating_sub(count.len() + 2),
+                    );
+                    let pad = width.saturating_sub(
+                        unicode_width(&label) + count.len() + 1,
+                    );
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!(" {label}"), style),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(count, Style::new().fg(DIM)),
+                    ]))
+                }
+            })
+            .collect();
+        let border = if self.focus == Focus::Sidebar {
+            ACCENT
+        } else {
+            DIM
+        };
+        let list = List::new(items)
+            .block(pane(border, "Vault"))
+            .highlight_style(if self.focus == Focus::Sidebar {
+                Style::new().bg(Color::Indexed(236))
+            } else {
+                Style::new()
+            });
+        f.render_stateful_widget(list, area, &mut self.sidebar);
+    }
+
+    fn draw_new(&self, f: &mut ratatui::Frame, area: Rect, form: &NewForm) {
+        let collections = self.writable_collections(form.vault);
+        let vault = if form.vault == 0 {
+            "My vault".to_string()
+        } else {
+            self.vault.organizations[form.vault - 1].1.clone()
+        };
+        let collection = collections.get(form.collection).map_or_else(
+            || "none you can write to".to_string(),
+            |c| c.name.clone(),
+        );
+        let folder = form
+            .folder
+            .checked_sub(1)
+            .and_then(|i| self.vault.folders.get(i))
+            .map_or_else(|| "none".to_string(), |(_, name)| name.clone());
+        let values = [
+            ("Type", crate::views::KINDS[form.kind].1.to_string()),
+            ("Vault", vault),
+            ("Collection", collection),
+            ("Folder", folder),
+        ];
+        let mut lines = vec![];
+        for row in self.new_rows(form) {
+            let (label, value) = &values[row];
+            let selected = row == form.row;
+            let style = if selected {
+                Style::new().bg(Color::Indexed(236)).bold()
+            } else {
+                Style::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "▌" } else { " " },
+                    Style::new().fg(ACCENT),
+                ),
+                Span::styled(format!("{label:<12}"), style),
+                Span::styled(format!("‹ {value} ›"), style.fg(ACCENT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        let name = self.query.trim();
+        lines.push(Line::from(Span::styled(
+            if name.is_empty() {
+                "the name is asked in the editor".to_string()
+            } else {
+                format!("name: {name} (from the filter)")
+            },
+            Style::new().fg(DIM),
+        )));
+        let hint = match crate::items::Kind::ALL[form.kind] {
+            crate::items::Kind::Login => {
+                "the editor starts with a generated password (^G settings)"
+            }
+            crate::items::Kind::SshKey => "a new ed25519 key is generated",
+            _ => "the rest is filled in in the editor",
+        };
+        lines.push(Line::from(Span::styled(hint, Style::new().fg(DIM))));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            "↑↓".bold().fg(ACCENT),
+            " choose  ".fg(DIM),
+            "←→ Space".bold().fg(ACCENT),
+            " change  ".fg(DIM),
+            "Enter".bold().fg(ACCENT),
+            " create  ".fg(DIM),
+            "Esc".bold().fg(ACCENT),
+            " cancel".fg(DIM),
+        ]));
+        draw_popup(f, area, "New item", lines);
+    }
+
+    fn draw_generator(&self, f: &mut ratatui::Frame, area: Rect) {
+        let g = &self.generator;
+        let (length, unit) = if g.diceware() {
+            (g.words, "words")
+        } else {
+            (g.len, "characters")
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                g.value.clone(),
+                Style::new().fg(Color::Green).bold(),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("{:<12}", "Type"), Style::new().fg(DIM)),
+                Span::styled(
+                    format!("‹ {} ›", GENERATOR_TYPES[g.ty].1),
+                    Style::new().fg(ACCENT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", "Length"),
+                    Style::new().fg(DIM),
+                ),
+                Span::styled(
+                    format!("‹ {length} {unit} ›"),
+                    Style::new().fg(ACCENT),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                "↑↓".bold().fg(ACCENT),
+                " type  ".fg(DIM),
+                "←→".bold().fg(ACCENT),
+                " length  ".fg(DIM),
+                "r".bold().fg(ACCENT),
+                " again  ".fg(DIM),
+                "Enter".bold().fg(ACCENT),
+                " copy  ".fg(DIM),
+                "Esc".bold().fg(ACCENT),
+                " close".fg(DIM),
+            ]),
+        ];
+        draw_popup(f, area, "Password generator", lines);
+    }
+}
+
+// runs a quick server request without leaving the tui, then reloads
+fn inline(
+    app: &mut App,
+    f: impl FnOnce() -> anyhow::Result<String>,
+) -> Outcome {
+    match f() {
+        Ok(msg) => {
+            app.message(msg, false);
+            Outcome::Reload
+        }
+        Err(e) => {
+            app.message(format!("{e:#}"), true);
+            Outcome::None
+        }
+    }
+}
+
+fn truncate(s: &str, width: usize) -> String {
+    if unicode_width(s) <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        if unicode_width(&out) + 2 > width {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+// "2026-10-25T21:31:51.123Z" -> "2026-10-25"
+fn day(date: &str) -> &str {
+    date.get(..10).unwrap_or(date)
+}
+
 fn needs_secret(key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Enter | KeyCode::Tab | KeyCode::Right => true,
-        KeyCode::Char('u' | 't' | 'r' | 'e' | 'n' | 'd') => ctrl,
+        KeyCode::Char('u' | 't' | 'r' | 'e' | 'n' | 'd' | 'f' | 'a') => ctrl,
         _ => false,
     }
 }
@@ -1129,7 +1946,11 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         ("^U  ^T", "copy username, totp code"),
         ("^R", "show or hide secrets"),
         ("^O", "open the web address"),
-        ("^E  ^N  ^D", "edit, new (named after the filter), trash"),
+        ("← ⇧Tab", "views: favorites, types, vaults, folders, trash"),
+        ("^E  ^D", "edit, move to the trash"),
+        ("^N", "new item (type, vault, collection, folder)"),
+        ("^F  ^A", "favorite, archive (toggle)"),
+        ("^G", "password generator"),
         ("^S", "sync"),
         ("^L", "lock and quit"),
         ("F2", "security settings (timeout, pin, system unlock)"),

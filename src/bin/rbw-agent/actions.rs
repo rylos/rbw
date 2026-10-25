@@ -937,35 +937,54 @@ pub async fn sync(
     } else {
         return Err(anyhow::anyhow!("failed to find access token in db"));
     };
-    let (protected_key, protected_private_key, protected_org_keys, entries) =
-        match rbw::actions::sync_once(&access_token).await {
-            Ok(res) => res,
-            Err(rbw::error::Error::RequestUnauthorized) => {
-                let access_token = fresh_access_token(
-                    state.clone(),
-                    None,
-                    Some(&access_token),
-                )
-                .await?;
-                rbw::actions::sync_once(&access_token)
-                    .await
-                    .context("failed to sync database from server")?
-            }
-            Err(e) => {
-                return Err(e).context("failed to sync database from server")
-            }
-        };
+    let data = match rbw::actions::sync_once(&access_token).await {
+        Ok(res) => res,
+        Err(rbw::error::Error::RequestUnauthorized) => {
+            let access_token =
+                fresh_access_token(state.clone(), None, Some(&access_token))
+                    .await?;
+            rbw::actions::sync_once(&access_token)
+                .await
+                .context("failed to sync database from server")?
+        }
+        Err(e) => {
+            return Err(e).context("failed to sync database from server")
+        }
+    };
     {
         let mut state = state.lock().await;
-        state.set_master_password_reprompt(&entries);
+        state.set_master_password_reprompt(&data.entries);
         state.login_expired_notified = false;
+        // organizations joined (or created) since the unlock
+        let known = state.org_keys.as_ref().map(|keys| {
+            data.protected_org_keys
+                .keys()
+                .all(|id| keys.contains_key(id))
+        });
+        if known == Some(false) {
+            if let Some(key) = &state.priv_key {
+                match rbw::actions::decrypt_org_keys(
+                    key,
+                    &data.protected_private_key,
+                    &data.protected_org_keys,
+                ) {
+                    Ok(org_keys) => state.org_keys = Some(org_keys),
+                    Err(e) => {
+                        eprintln!("failed to decrypt the new org keys: {e}");
+                    }
+                }
+            }
+        }
     }
     // the tokens may have been replaced while syncing
     let mut db = load_db().await?;
-    db.protected_key = Some(protected_key);
-    db.protected_private_key = Some(protected_private_key);
-    db.protected_org_keys = protected_org_keys;
-    db.entries = entries;
+    db.protected_key = Some(data.protected_key);
+    db.protected_private_key = Some(data.protected_private_key);
+    db.protected_org_keys = data.protected_org_keys;
+    db.entries = data.entries;
+    db.organizations = data.organizations;
+    db.collections = data.collections;
+    db.folders = data.folders;
     save_db(&db).await?;
 
     if let Err(e) = subscribe_to_notifications(state.clone()).await {

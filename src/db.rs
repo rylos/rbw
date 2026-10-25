@@ -21,6 +21,41 @@ pub struct Entry {
     pub master_password_reprompt: crate::api::CipherRepromptType,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub collection_ids: Vec<String>,
+}
+
+// what the official clients show in their sidebar; names are encrypted
+// like the entries (folders with the user key, collections with their
+// organization's key), organization names come in clear
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
+pub struct Organization {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
+pub struct Collection {
+    pub id: String,
+    pub org_id: String,
+    pub name: String,
+    pub read_only: bool,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(
@@ -207,6 +242,13 @@ pub struct Db {
     pub api_key_login: bool,
 
     pub entries: Vec<Entry>,
+
+    #[serde(default)]
+    pub organizations: Vec<Organization>,
+    #[serde(default)]
+    pub collections: Vec<Collection>,
+    #[serde(default)]
+    pub folders: Vec<Folder>,
 }
 
 impl Db {

@@ -25,6 +25,108 @@ const MAX_PASSWORD_HISTORY: usize = 5;
 
 const NOTES_SEPARATOR: &str = "--- notes ---";
 
+// the item types rbw can create and edit
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Login,
+    Note,
+    Card,
+    Identity,
+    SshKey,
+}
+
+const CARD_VALUES: &[(&str, &str)] = &[
+    ("cardholder", "cardholderName"),
+    ("brand", "brand"),
+    ("number", "number"),
+    ("exp month", "expMonth"),
+    ("exp year", "expYear"),
+    ("code", "code"),
+];
+
+const IDENTITY_VALUES: &[(&str, &str)] = &[
+    ("title", "title"),
+    ("first name", "firstName"),
+    ("middle name", "middleName"),
+    ("last name", "lastName"),
+    ("username", "username"),
+    ("company", "company"),
+    ("email", "email"),
+    ("phone", "phone"),
+    ("address 1", "address1"),
+    ("address 2", "address2"),
+    ("address 3", "address3"),
+    ("city", "city"),
+    ("state", "state"),
+    ("postal code", "postalCode"),
+    ("country", "country"),
+    ("ssn", "ssn"),
+    ("passport number", "passportNumber"),
+    ("license number", "licenseNumber"),
+];
+
+impl Kind {
+    // in the order of views::KINDS, which the tui shows
+    pub const ALL: [Self; 5] = [
+        Self::Login,
+        Self::Card,
+        Self::Identity,
+        Self::Note,
+        Self::SshKey,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "login" => Some(Self::Login),
+            "note" | "secure-note" => Some(Self::Note),
+            "card" => Some(Self::Card),
+            "identity" => Some(Self::Identity),
+            "ssh-key" | "ssh" => Some(Self::SshKey),
+            _ => None,
+        }
+    }
+
+    fn ty(self) -> u64 {
+        match self {
+            Self::Login => 1,
+            Self::Note => 2,
+            Self::Card => 3,
+            Self::Identity => 4,
+            Self::SshKey => 5,
+        }
+    }
+
+    fn from_ty(ty: u64) -> Self {
+        match ty {
+            1 => Self::Login,
+            3 => Self::Card,
+            4 => Self::Identity,
+            5 => Self::SshKey,
+            // newer types (bank accounts, passports, ...) are edited like
+            // notes: name, folder, fields and notes
+            _ => Self::Note,
+        }
+    }
+
+    // the object holding the type's own values, with (form key, json key)
+    // pairs; ssh keys are generated or imported, not typed in
+    fn values(
+        self,
+    ) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+        match self {
+            Self::Card => Some(("card", CARD_VALUES)),
+            Self::Identity => Some(("identity", IDENTITY_VALUES)),
+            _ => None,
+        }
+    }
+
+    fn empty_typed(self) -> Vec<(String, Option<String>)> {
+        self.values().map_or_else(Vec::new, |(_, keys)| {
+            keys.iter().map(|(k, _)| ((*k).to_string(), None)).collect()
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Changes {
     pub name: Option<String>,
@@ -144,6 +246,8 @@ struct Form {
     name: String,
     // only for login entries
     login: Option<LoginForm>,
+    // the values of cards and identities, in Kind::values order
+    typed: Vec<(String, Option<String>)>,
     folder: Option<String>,
     fields: Vec<FormField>,
     notes: Option<String>,
@@ -202,6 +306,10 @@ impl Item {
             .get("type")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::from_ty(self.ty())
     }
 
     fn decrypt(
@@ -288,6 +396,20 @@ impl Item {
         } else {
             None
         };
+        let mut typed = vec![];
+        if let Some((section, keys)) = self.kind().values() {
+            let values = self.json.get(section).cloned().unwrap_or_default();
+            for (key, json_key) in keys {
+                typed.push((
+                    (*key).to_string(),
+                    values
+                        .get(json_key)
+                        .map(|v| self.decrypt(v))
+                        .transpose()?
+                        .flatten(),
+                ));
+            }
+        }
         let mut fields = vec![];
         for field in self
             .json
@@ -324,6 +446,7 @@ impl Item {
         Ok(Form {
             name: self.decrypt_key("name")?.unwrap_or_default(),
             login,
+            typed,
             folder,
             fields,
             notes: self.decrypt_key("notes")?,
@@ -353,6 +476,31 @@ impl Item {
 
         if let (Some(old_login), Some(new_login)) = (&old.login, &new.login) {
             self.apply_login(old_login, new_login)?;
+        }
+
+        if new.typed != old.typed {
+            if let Some((section, keys)) = self.kind().values() {
+                let mut values = self
+                    .json
+                    .get(section)
+                    .cloned()
+                    .filter(serde_json::Value::is_object)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                for ((key, value), (_, json_key)) in
+                    new.typed.iter().zip(keys.iter())
+                {
+                    let before = old
+                        .typed
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .and_then(|(_, v)| v.as_ref());
+                    if before != value.as_ref() {
+                        values[*json_key] =
+                            self.encrypt_opt(value.as_deref())?;
+                    }
+                }
+                self.json[section] = values;
+            }
         }
 
         if new.fields != old.fields {
@@ -494,7 +642,12 @@ pub struct NewItem {
     pub username: Option<String>,
     pub uris: Vec<String>,
     pub folder: Option<String>,
-    pub secure_note: bool,
+    pub kind: Kind,
+    // organization id and the ids of its collections the item goes in
+    pub org: Option<String>,
+    pub collections: Vec<String>,
+    // for logins edited in the editor: a generated password to start from
+    pub password: Option<String>,
     pub changes: Changes,
     pub no_edit: bool,
     pub attach: Vec<std::path::PathBuf>,
@@ -503,36 +656,38 @@ pub struct NewItem {
 pub fn add(item: &NewItem) -> anyhow::Result<()> {
     crate::commands::unlock()?;
 
+    let login = item.kind == Kind::Login;
     let mut form = Form {
         name: item.name.clone(),
-        login: if item.secure_note {
-            None
-        } else {
-            Some(LoginForm {
-                username: item.username.clone(),
-                password: None,
-                totp: None,
-                uris: item.uris.clone(),
-            })
-        },
+        login: login.then(|| LoginForm {
+            username: item.username.clone(),
+            password: item.password.clone(),
+            totp: None,
+            uris: item.uris.clone(),
+        }),
+        typed: item.kind.empty_typed(),
         folder: item.folder.clone(),
         fields: vec![],
         notes: None,
     };
-    if item.secure_note && (item.username.is_some() || !item.uris.is_empty())
-    {
-        return Err(anyhow::anyhow!("secure notes have no username or uris"));
+    if !login && (item.username.is_some() || !item.uris.is_empty()) {
+        return Err(anyhow::anyhow!("only logins have a username and uris"));
+    }
+    if item.org.is_some() && item.collections.is_empty() {
+        return Err(anyhow::anyhow!(
+            "an organization item needs at least one collection"
+        ));
     }
 
     let interactive = std::io::stdin().is_terminal();
     if !item.changes.is_empty() || item.no_edit {
         item.changes.apply(&mut form)?;
     } else if interactive {
-        form = edit_form(&form, item.secure_note)?;
+        form = edit_form(&form, item.kind)?;
     } else {
         // the historical format: the first line of stdin is the password,
         // the rest are the notes
-        let (password, notes) = read_legacy_stdin(!item.secure_note)?;
+        let (password, notes) = read_legacy_stdin(login)?;
         if let Some(login) = &mut form.login {
             login.password = password;
         }
@@ -542,28 +697,45 @@ pub fn add(item: &NewItem) -> anyhow::Result<()> {
     let mut new = Item {
         json: serde_json::json!({}),
         entry_key: None,
-        org_id: None,
+        org_id: item.org.clone(),
     };
     let folder_id = resolve_folder(form.folder.as_deref())?;
     let empty = Form {
         name: String::new(),
         login: form.login.as_ref().map(|_| LoginForm::default()),
+        typed: item.kind.empty_typed(),
         folder: None,
         fields: vec![],
         notes: None,
     };
-    new.json = if item.secure_note {
-        serde_json::json!({
-            "type": 2,
-            "secureNote": { "type": 0 },
-        })
-    } else {
-        serde_json::json!({
-            "type": 1,
-            "login": { "username": null, "password": null, "totp": null, "uris": [] },
-        })
-    };
-    new.json["organizationId"] = serde_json::Value::Null;
+    new.json = serde_json::json!({ "type": item.kind.ty() });
+    match item.kind {
+        Kind::Login => {
+            new.json["login"] = serde_json::json!({
+                "username": null, "password": null, "totp": null, "uris": [],
+            });
+        }
+        Kind::Note => {
+            new.json["secureNote"] = serde_json::json!({ "type": 0 });
+        }
+        Kind::Card | Kind::Identity => {
+            if let Some((section, _)) = item.kind.values() {
+                new.json[section] = serde_json::json!({});
+            }
+        }
+        Kind::SshKey => {
+            let (private, public, fingerprint) = generate_ssh_key()?;
+            new.json["sshKey"] = serde_json::json!({
+                "privateKey": new.encrypt(&private)?,
+                "publicKey": new.encrypt(&public)?,
+                "keyFingerprint": new.encrypt(&fingerprint)?,
+            });
+        }
+    }
+    new.json["organizationId"] = item
+        .org
+        .clone()
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
     new.json["favorite"] =
         serde_json::Value::Bool(item.changes.favorite.unwrap_or(false));
     new.json["reprompt"] = serde_json::json!(0);
@@ -577,7 +749,11 @@ pub fn add(item: &NewItem) -> anyhow::Result<()> {
         json["encryptedFor"] = serde_json::Value::String(
             rbw::api::access_token_user_id(access_token)?,
         );
-        client.create_cipher(access_token, &json)
+        if item.org.is_some() {
+            client.create_org_cipher(access_token, &json, &item.collections)
+        } else {
+            client.create_cipher(access_token, &json)
+        }
     })
     .context("failed to create the entry")?;
 
@@ -609,7 +785,7 @@ pub fn edit(
         changes.apply(&mut new)?;
         new
     } else if std::io::stdin().is_terminal() {
-        edit_form(&old, old.login.is_none())?
+        edit_form(&old, item.kind())?
     } else {
         let (password, notes) = read_legacy_stdin(old.login.is_some())?;
         if password.is_none() && notes.is_none() {
@@ -728,7 +904,7 @@ pub fn restore(needle: &str) -> anyhow::Result<()> {
 }
 
 // (id, name, deleted date) of every item in the trash
-fn trashed() -> anyhow::Result<Vec<(String, String, String)>> {
+pub fn trashed() -> anyhow::Result<Vec<(String, String, String)>> {
     let ciphers = api_call(rbw::api::Client::trashed_ciphers)
         .context("failed to read the trash from the server")?;
     let mut items = vec![];
@@ -746,6 +922,146 @@ fn trashed() -> anyhow::Result<Vec<(String, String, String)>> {
     }
     items.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(items)
+}
+
+pub fn restore_id(id: &str) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    api_call(|client, access_token| client.restore_cipher(access_token, id))
+        .context("failed to restore the entry")?;
+    crate::actions::sync()?;
+    Ok(())
+}
+
+// deletes an item for good, also from the trash
+pub fn purge_id(id: &str) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    api_call(|client, access_token| client.remove(access_token, id))
+        .context("failed to delete the entry")?;
+    crate::actions::sync()?;
+    Ok(())
+}
+
+// archived items are kept but hidden from the vault and from autofill in
+// the official clients
+pub fn set_archived(id: &str, archived: bool) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    api_call(|client, access_token| {
+        client.archive_cipher(access_token, id, archived)
+    })
+    .context(if archived {
+        "failed to archive the entry"
+    } else {
+        "failed to unarchive the entry"
+    })?;
+    crate::actions::sync()?;
+    Ok(())
+}
+
+pub fn archive(
+    needle: Needle,
+    username: Option<&str>,
+    folder: Option<&str>,
+    ignore_case: bool,
+    archived: bool,
+) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    let (entry, _) = find(needle, username, folder, ignore_case)?;
+    if entry.archived == archived {
+        eprintln!(
+            "{}",
+            if archived {
+                "already archived"
+            } else {
+                "not archived"
+            }
+        );
+        return Ok(());
+    }
+    set_archived(&entry.id, archived)
+}
+
+pub fn set_favorite(id: &str, favorite: bool) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    let mut item = Item::fetch(id)?;
+    item.json["favorite"] = serde_json::Value::Bool(favorite);
+    item.save()?;
+    crate::actions::sync()?;
+    Ok(())
+}
+
+// the organization (by name or id) and the ids of the named collections
+pub fn resolve_collections(
+    org: &str,
+    names: &[String],
+) -> anyhow::Result<(String, Vec<String>)> {
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let vault = crate::commands::tui_vault(&db)?;
+    let org = vault
+        .organizations
+        .iter()
+        .find(|(id, name)| id == org || name == org)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no organization named '{org}'"))?;
+    let mut ids = vec![];
+    for name in names {
+        let found = vault
+            .collections
+            .iter()
+            .find(|c| c.org_id == org && (&c.id == name || &c.name == name))
+            .ok_or_else(|| anyhow::anyhow!("no collection named '{name}'"))?;
+        if found.read_only {
+            return Err(anyhow::anyhow!(
+                "the collection '{name}' is read only"
+            ));
+        }
+        ids.push(found.id.clone());
+    }
+    Ok((org, ids))
+}
+
+// a new ed25519 key, as the official clients make them: (private key in
+// openssh format, public key, sha256 fingerprint)
+fn generate_ssh_key() -> anyhow::Result<(String, String, String)> {
+    let dir = tempfile::tempdir()
+        .context("failed to create a temporary directory")?;
+    let path = dir.path().join("key");
+    let run = |args: &[&std::ffi::OsStr]| -> anyhow::Result<String> {
+        let out = std::process::Command::new("ssh-keygen")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("failed to run ssh-keygen (is openssh installed?)")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "ssh-keygen failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    run(&[
+        "-q".as_ref(),
+        "-t".as_ref(),
+        "ed25519".as_ref(),
+        "-N".as_ref(),
+        "".as_ref(),
+        "-C".as_ref(),
+        "".as_ref(),
+        "-f".as_ref(),
+        path.as_os_str(),
+    ])?;
+    let private = std::fs::read_to_string(&path)
+        .context("failed to read the generated key")?;
+    let public = run(&["-y".as_ref(), "-f".as_ref(), path.as_os_str()])?;
+    let fingerprint = run(&["-l".as_ref(), "-f".as_ref(), path.as_os_str()])?;
+    // "256 SHA256:... comment (ED25519)"
+    let fingerprint = fingerprint
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    Ok((private.trim_end().to_string(), public, fingerprint))
 }
 
 pub fn folder_list(raw: bool) -> anyhow::Result<()> {
@@ -1159,6 +1475,9 @@ fn render_form(form: &Form) -> String {
             let _ = writeln!(out, "uri: {uri}");
         }
     }
+    for (key, value) in &form.typed {
+        let _ = writeln!(out, "{key}: {}", value.as_deref().unwrap_or(""));
+    }
     let _ = writeln!(out, "folder: {}", form.folder.as_deref().unwrap_or(""));
     for field in &form.fields {
         let ty = match field.ty {
@@ -1177,10 +1496,11 @@ fn render_form(form: &Form) -> String {
     out
 }
 
-fn parse_form(contents: &str, login: bool) -> anyhow::Result<Form> {
+fn parse_form(contents: &str, kind: Kind) -> anyhow::Result<Form> {
     let mut form = Form {
         name: String::new(),
-        login: login.then(LoginForm::default),
+        login: (kind == Kind::Login).then(LoginForm::default),
+        typed: kind.empty_typed(),
         folder: None,
         fields: vec![],
         notes: None,
@@ -1206,6 +1526,12 @@ fn parse_form(contents: &str, login: bool) -> anyhow::Result<Form> {
         // else to the value (passwords may start with spaces)
         let value = value.strip_prefix(' ').unwrap_or(value);
         let key = key.trim();
+        if let Some((_, typed)) =
+            form.typed.iter_mut().find(|(k, _)| k == key)
+        {
+            *typed = non_empty(value.trim());
+            continue;
+        }
         match key {
             "name" => form.name = value.to_string(),
             "username" => {
@@ -1286,11 +1612,11 @@ fn login_values<'a>(
 
 // opens the editor until the contents parse, so that a typo doesn't throw
 // away what was written
-fn edit_form(form: &Form, secure_note: bool) -> anyhow::Result<Form> {
+fn edit_form(form: &Form, kind: Kind) -> anyhow::Result<Form> {
     let mut contents = render_form(form);
     loop {
         let edited = rbw::edit::edit(&contents, "")?;
-        match parse_form(&edited, !secure_note && form.login.is_some()) {
+        match parse_form(&edited, kind) {
             Ok(form) => return Ok(form),
             Err(e) => {
                 eprintln!("{e}");
@@ -1379,6 +1705,7 @@ mod tests {
                     "https://b.example".to_string(),
                 ],
             }),
+            typed: vec![],
             folder: Some("Internet".to_string()),
             fields: vec![
                 FormField {
@@ -1404,26 +1731,37 @@ mod tests {
     #[test]
     fn test_form_roundtrip() {
         let form = login_form();
-        assert_eq!(parse_form(&render_form(&form), true).unwrap(), form);
+        assert_eq!(
+            parse_form(&render_form(&form), Kind::Login).unwrap(),
+            form
+        );
 
         let mut note = form;
         note.login = None;
         note.notes = None;
-        assert_eq!(parse_form(&render_form(&note), false).unwrap(), note);
+        assert_eq!(
+            parse_form(&render_form(&note), Kind::Note).unwrap(),
+            note
+        );
     }
 
     #[test]
     fn test_form_errors() {
-        assert!(parse_form("name: x\n", true).is_err());
-        assert!(parse_form("name: \n--- notes ---\n", true).is_err());
-        assert!(
-            parse_form("name: x\nbogus: y\n--- notes ---\n", true).is_err()
-        );
-        assert!(parse_form("name: x\nusername: y\n--- notes ---\n", false)
-            .is_err());
+        assert!(parse_form("name: x\n", Kind::Login).is_err());
+        assert!(parse_form("name: \n--- notes ---\n", Kind::Login).is_err());
+        assert!(parse_form(
+            "name: x\nbogus: y\n--- notes ---\n",
+            Kind::Login
+        )
+        .is_err());
+        assert!(parse_form(
+            "name: x\nusername: y\n--- notes ---\n",
+            Kind::Note
+        )
+        .is_err());
         assert!(parse_form(
             "name: x\nboolean: f = maybe\n--- notes ---\n",
-            true
+            Kind::Login
         )
         .is_err());
     }
