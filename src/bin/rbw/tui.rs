@@ -8,14 +8,18 @@
 // Ctrl with a letter copies (P password, U username, T totp), Alt with the
 // same letter types it into the previous window instead (typer.rs) and quits,
 // like rofi-rbw. Enter opens a menu with these and the other actions.
+// The mouse works too: a click selects, a double click (or a right click)
+// does what Enter does, the wheel scrolls; in a popup a click on the
+// selected row changes it and a click outside closes it.
 
 use std::io::IsTerminal as _;
 
 use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::{execute, terminal};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize as _};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -28,6 +32,8 @@ use crate::views::{Row, View};
 
 const CLIPBOARD_SECONDS: u64 = 30;
 const MESSAGE_SECONDS: u64 = 4;
+const DOUBLE_CLICK: std::time::Duration =
+    std::time::Duration::from_millis(400);
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -133,6 +139,21 @@ impl Generator {
     }
 }
 
+// where the last frame drew what, for the mouse
+#[derive(Default)]
+struct Hits {
+    input: Rect,
+    // only while it is on screen
+    sidebar: Option<Rect>,
+    list: Rect,
+    details: Rect,
+    // (y, height, index in detail_lines()) of the fields
+    fields: Vec<(u16, u16, usize)>,
+    popup: Option<Rect>,
+    // the whole frame
+    area: Rect,
+}
+
 struct App {
     db: rbw::db::Db,
     entries: Vec<TuiEntry>,
@@ -161,6 +182,9 @@ struct App {
     // dropped and the next key that needs a secret unlocks first
     locked: bool,
     quit: bool,
+    hits: Hits,
+    // (when, column, row) of the last left click, for double clicks
+    last_click: Option<(std::time::Instant, u16, u16)>,
 }
 
 enum Outcome {
@@ -208,7 +232,11 @@ fn fail(e: &anyhow::Error) -> ! {
 
 fn enter() -> anyhow::Result<Term> {
     terminal::enable_raw_mode()?;
-    execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
+    execute!(
+        std::io::stdout(),
+        terminal::EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     let term = ratatui::Terminal::new(
         ratatui::backend::CrosstermBackend::new(std::io::stdout()),
     )?;
@@ -217,7 +245,11 @@ fn enter() -> anyhow::Result<Term> {
 
 fn leave() -> anyhow::Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
+    execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -262,6 +294,8 @@ impl App {
             last_sync: db_mtime(),
             locked: false,
             quit: false,
+            hits: Hits::default(),
+            last_click: None,
         };
         app.refilter();
         Ok(app)
@@ -898,12 +932,14 @@ impl App {
                 self.check_lock();
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => key,
+                Event::Mouse(mouse) => match self.handle_mouse(mouse) {
+                    Some(key) => key,
+                    None => continue,
+                },
+                _ => continue,
             };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
             if needs_secret(&key) && matches!(self.mode, Mode::Normal) {
                 self.check_lock();
                 if self.locked {
@@ -961,6 +997,183 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // a click or the wheel: changes the selection, and returns the key to
+    // handle for what Enter (or Esc, or an arrow) would do there
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<KeyEvent> {
+        let at = Position::new(mouse.column, mouse.row);
+        let key = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
+        let double = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let double = self.last_click.is_some_and(|(when, x, y)| {
+                    when.elapsed() < DOUBLE_CLICK && (x, y) == (at.x, at.y)
+                });
+                self.last_click = (!double)
+                    .then(|| (std::time::Instant::now(), at.x, at.y));
+                double
+            }
+            MouseEventKind::Down(MouseButton::Right) => true,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => false,
+            _ => return None,
+        };
+        let up = mouse.kind == MouseEventKind::ScrollUp;
+        let scroll = up || mouse.kind == MouseEventKind::ScrollDown;
+
+        if !matches!(self.mode, Mode::Normal) {
+            let popup = self.hits.popup.unwrap_or_default();
+            if matches!(
+                self.mode,
+                Mode::Help | Mode::ConfirmTrash(_) | Mode::ConfirmPurge(_)
+            ) {
+                return (!scroll).then(|| key(KeyCode::Esc)).flatten();
+            }
+            if scroll {
+                return key(if up { KeyCode::Up } else { KeyCode::Down });
+            }
+            if !popup.contains(at) {
+                return key(KeyCode::Esc);
+            }
+            let line = usize::from(at.y.saturating_sub(popup.y + 1));
+            return self.popup_click(line);
+        }
+
+        if let Some(sidebar) = self.hits.sidebar.filter(|r| r.contains(at)) {
+            if scroll {
+                self.sidebar_move(if up { -1 } else { 1 });
+                return None;
+            }
+            let row = self.sidebar.offset()
+                + usize::from(at.y.saturating_sub(sidebar.y + 1));
+            if let Some(Row::View { view, .. }) = self.rows.get(row) {
+                let view = view.clone();
+                self.sidebar.select(Some(row));
+                self.set_view(view);
+                self.focus = Focus::List;
+            }
+            return None;
+        }
+        if self.hits.list.contains(at) {
+            if self.focus == Focus::Sidebar {
+                self.focus = Focus::List;
+            }
+            if scroll {
+                self.focus = Focus::List;
+                self.move_by(if up { -1 } else { 1 });
+                return None;
+            }
+            let row = self.list.offset()
+                + usize::from(at.y.saturating_sub(self.hits.list.y + 1));
+            if row >= self.filtered.len() {
+                return None;
+            }
+            self.focus = Focus::List;
+            if self.list.selected() != Some(row) {
+                self.list.select(Some(row));
+                self.on_select();
+            }
+            return double.then(|| key(KeyCode::Enter)).flatten();
+        }
+        if self.hits.details.contains(at) {
+            let loaded = self
+                .selected()
+                .is_some_and(|e| self.details.contains_key(&e.id));
+            if !loaded {
+                return None;
+            }
+            if scroll {
+                self.focus = Focus::Details;
+                self.move_by(if up { -1 } else { 1 });
+                return None;
+            }
+            let field = self
+                .hits
+                .fields
+                .iter()
+                .find(|(y, h, _)| (*y..y + h).contains(&at.y))
+                .map(|(_, _, n)| *n)?;
+            self.focus = Focus::Details;
+            self.detail_line = field;
+            return double.then(|| key(KeyCode::Enter)).flatten();
+        }
+        if self.hits.input.contains(at) && !scroll {
+            self.focus = Focus::List;
+        }
+        None
+    }
+
+    // a click on a line of the popup: the first click selects a row, the
+    // second one changes it (or does what it says)
+    fn popup_click(&mut self, line: usize) -> Option<KeyEvent> {
+        let key = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
+        let (mode, pressed) =
+            match std::mem::replace(&mut self.mode, Mode::Normal) {
+                Mode::Actions(row) => {
+                    if line < self.actions().len() {
+                        (Mode::Actions(line), key(KeyCode::Enter))
+                    } else {
+                        (Mode::Actions(row), None)
+                    }
+                }
+                Mode::Settings(row) => {
+                    // a blank line after the first two rows
+                    let clicked = match line {
+                        0 | 1 => Some(line),
+                        2 => None,
+                        _ => Some(line - 1),
+                    }
+                    .filter(|&r| r < crate::settings::ROWS);
+                    match clicked {
+                        Some(r) if r == row => {
+                            (Mode::Settings(row), key(KeyCode::Enter))
+                        }
+                        Some(r) => (Mode::Settings(r), None),
+                        None => (Mode::Settings(row), None),
+                    }
+                }
+                Mode::New(mut form) => {
+                    let clicked = self.new_rows(&form).get(line).copied();
+                    let pressed = match clicked {
+                        Some(r) if r == form.row => key(KeyCode::Char(' ')),
+                        Some(r) => {
+                            form.row = r;
+                            None
+                        }
+                        None => None,
+                    };
+                    (Mode::New(form), pressed)
+                }
+                Mode::Generator => {
+                    let pressed = match line {
+                        0 => key(KeyCode::Enter),
+                        2 | 3 if self.generator.row == line - 2 => {
+                            key(KeyCode::Right)
+                        }
+                        2 | 3 => {
+                            self.generator.row = line - 2;
+                            None
+                        }
+                        _ => None,
+                    };
+                    (Mode::Generator, pressed)
+                }
+                Mode::Pick(form, mut picker) => {
+                    let height = pick_height(self.hits.area);
+                    let first = picker.selected.saturating_sub(height - 1);
+                    let n = self.picked(&form, &picker).len();
+                    let pressed = match line.checked_sub(1) {
+                        Some(i) if i < height && first + i < n => {
+                            picker.selected = first + i;
+                            key(KeyCode::Enter)
+                        }
+                        _ => None,
+                    };
+                    (Mode::Pick(form, picker), pressed)
+                }
+                mode => (mode, None),
+            };
+        self.mode = mode;
+        pressed
     }
 
     // the new item starts from the view: its type, vault, collection or
@@ -1537,6 +1750,9 @@ impl App {
             .split(area);
 
         self.draw_input(f, rows[0]);
+        self.hits.area = area;
+        self.hits.input = rows[0];
+        self.hits.sidebar = None;
 
         let mut body = rows[1];
         if area.width >= SIDEBAR_WIDTH {
@@ -1545,6 +1761,7 @@ impl App {
                 .constraints([Constraint::Length(28), Constraint::Min(10)])
                 .split(body);
             self.draw_sidebar(f, cols[0]);
+            self.hits.sidebar = Some(cols[0]);
             body = cols[1];
         }
         let wide = area.width >= 90;
@@ -1562,22 +1779,28 @@ impl App {
             .split(body);
         if area.width < SIDEBAR_WIDTH && self.focus == Focus::Sidebar {
             self.draw_sidebar(f, panes[0]);
+            self.hits.sidebar = Some(panes[0]);
+            self.hits.list = Rect::default();
         } else {
             self.draw_list(f, panes[0]);
+            self.hits.list = panes[0];
         }
         self.draw_details(f, panes[1]);
+        self.hits.details = panes[1];
         self.draw_footer(f, rows[2]);
 
-        match &self.mode {
-            Mode::Help => draw_help(f, area),
-            Mode::Settings(row) => draw_settings(f, area, *row),
-            Mode::New(form) => self.draw_new(f, area, form),
-            Mode::Actions(row) => self.draw_actions(f, area, *row),
-            Mode::Generator => self.draw_generator(f, area),
-            Mode::Pick(form, picker) => self.draw_pick(f, area, form, picker),
+        self.hits.popup = match &self.mode {
+            Mode::Help => Some(draw_help(f, area)),
+            Mode::Settings(row) => Some(draw_settings(f, area, *row)),
+            Mode::New(form) => Some(self.draw_new(f, area, form)),
+            Mode::Actions(row) => Some(self.draw_actions(f, area, *row)),
+            Mode::Generator => Some(self.draw_generator(f, area)),
+            Mode::Pick(form, picker) => {
+                Some(self.draw_pick(f, area, form, picker))
+            }
             Mode::ConfirmPurge(_) => {
                 let name = self.selected().map_or("", |e| e.name.as_str());
-                draw_popup(
+                Some(draw_popup(
                     f,
                     area,
                     "Delete for good",
@@ -1591,11 +1814,11 @@ impl App {
                             " yes   any other key: no".into(),
                         ]),
                     ],
-                );
+                ))
             }
             Mode::ConfirmTrash(_) => {
                 let name = self.selected().map_or("", |e| e.name.as_str());
-                draw_popup(
+                Some(draw_popup(
                     f,
                     area,
                     "Trash",
@@ -1607,10 +1830,10 @@ impl App {
                             " yes   any other key: no".into(),
                         ]),
                     ],
-                );
+                ))
             }
-            Mode::Normal => {}
-        }
+            Mode::Normal => None,
+        };
     }
 
     fn draw_input(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -1698,7 +1921,8 @@ impl App {
         f.render_stateful_widget(list, area, &mut self.list);
     }
 
-    fn draw_details(&self, f: &mut ratatui::Frame, area: Rect) {
+    fn draw_details(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        self.hits.fields.clear();
         let border = if self.focus == Focus::Details {
             ACCENT
         } else {
@@ -1712,6 +1936,8 @@ impl App {
             return;
         };
         let mut lines = vec![];
+        // the field each line shows, for the mouse
+        let mut tags: Vec<Option<usize>> = vec![];
         if let Some(deleted) = &entry.deleted {
             lines.push(Line::from(Span::styled(
                 format!("in the trash since {}", day(deleted)),
@@ -1782,6 +2008,7 @@ impl App {
                 .unwrap_or(0)
                 .min(14);
             for (n, (label, value, secret)) in values.iter().enumerate() {
+                tags.resize(lines.len(), None);
                 let selected =
                     self.focus == Focus::Details && n == self.detail_line;
                 let style = if selected {
@@ -1847,6 +2074,7 @@ impl App {
                     }
                     lines.push(Line::from(spans));
                 }
+                tags.resize(lines.len(), Some(n));
             }
             if details.history > 0 {
                 lines.push(Line::from(""));
@@ -1891,12 +2119,25 @@ impl App {
             }
         }
 
+        // where each field ends up once the lines are wrapped
+        let width = usize::from(area.width.saturating_sub(2)).max(1);
+        let mut fields = vec![];
+        let mut y = area.y + 1;
+        for (line, tag) in lines.iter().zip(&tags) {
+            let h = u16::try_from(line.width().div_ceil(width).max(1))
+                .unwrap_or(1);
+            if let Some(n) = tag {
+                fields.push((y, h, *n));
+            }
+            y = y.saturating_add(h);
+        }
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .wrap(Wrap { trim: false })
                 .block(pane(border, &entry.name)),
             area,
         );
+        self.hits.fields = fields;
     }
 
     fn draw_footer(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -2027,7 +2268,12 @@ impl App {
         f.render_stateful_widget(list, area, &mut self.sidebar);
     }
 
-    fn draw_new(&self, f: &mut ratatui::Frame, area: Rect, form: &NewForm) {
+    fn draw_new(
+        &self,
+        f: &mut ratatui::Frame,
+        area: Rect,
+        form: &NewForm,
+    ) -> Rect {
         let collections = self.writable_collections(form.vault);
         let vault = if form.vault == 0 {
             "My vault".to_string()
@@ -2098,10 +2344,10 @@ impl App {
             "Esc".bold().fg(ACCENT),
             " cancel".fg(DIM),
         ]));
-        draw_popup(f, area, "New item", lines);
+        draw_popup(f, area, "New item", lines)
     }
 
-    fn draw_generator(&self, f: &mut ratatui::Frame, area: Rect) {
+    fn draw_generator(&self, f: &mut ratatui::Frame, area: Rect) -> Rect {
         let g = &self.generator;
         let (length, unit) = if g.diceware() {
             (g.words, "words")
@@ -2130,10 +2376,15 @@ impl App {
                 " close".fg(DIM),
             ]),
         ];
-        draw_popup(f, area, "Password generator", lines);
+        draw_popup(f, area, "Password generator", lines)
     }
 
-    fn draw_actions(&self, f: &mut ratatui::Frame, area: Rect, row: usize) {
+    fn draw_actions(
+        &self,
+        f: &mut ratatui::Frame,
+        area: Rect,
+        row: usize,
+    ) -> Rect {
         let rows = self.actions();
         let width = rows
             .iter()
@@ -2167,7 +2418,7 @@ impl App {
             " close".fg(DIM),
         ]));
         let title = self.selected().map_or("", |e| e.name.as_str());
-        draw_popup(f, area, title, lines);
+        draw_popup(f, area, title, lines)
     }
 
     fn draw_pick(
@@ -2176,13 +2427,13 @@ impl App {
         area: Rect,
         form: &NewForm,
         picker: &Picker,
-    ) {
+    ) -> Rect {
         let title =
             ["Type", "Vault", "Collection", "Folder"][form.row.min(3)];
         let picked = self.picked(form, picker);
         let current = Self::choice(form);
         // enough rows to fill most of the screen, scrolled to the selection
-        let height = usize::from(area.height.saturating_sub(8)).clamp(3, 20);
+        let height = pick_height(area);
         let first = picker.selected.saturating_sub(height - 1);
         let mut lines = vec![Line::from(vec![
             Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
@@ -2229,8 +2480,13 @@ impl App {
             "Esc".bold().fg(ACCENT),
             " back".fg(DIM),
         ]));
-        draw_popup(f, area, title, lines);
+        draw_popup(f, area, title, lines)
     }
+}
+
+// how many choices the pick popup shows at once
+fn pick_height(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(8)).clamp(3, 20)
 }
 
 // a "label  ‹ value ›" row of a popup, marked when selected
@@ -2321,7 +2577,7 @@ fn draw_popup(
     area: Rect,
     title: &str,
     lines: Vec<Line>,
-) {
+) -> Rect {
     let h = u16::try_from(lines.len() + 2).unwrap_or(10);
     let w = area.width.min(72);
     let popup = Rect {
@@ -2337,9 +2593,10 @@ fn draw_popup(
             .block(pane(ACCENT, title)),
         popup,
     );
+    popup
 }
 
-fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) {
+fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) -> Rect {
     let settings = crate::settings::Settings::load();
     let quick = settings.pin || settings.system_auth;
     let check = |on: bool| if on { "[x]" } else { "[ ]" };
@@ -2429,10 +2686,10 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) {
         "Esc".bold().fg(ACCENT),
         " close".fg(DIM),
     ]));
-    draw_popup(f, area, "Security", lines);
+    draw_popup(f, area, "Security", lines)
 }
 
-fn draw_help(f: &mut ratatui::Frame, area: Rect) {
+fn draw_help(f: &mut ratatui::Frame, area: Rect) -> Rect {
     let rows = [
         ("type", "filter (fuzzy; 'exact ^prefix suffix$ !not)"),
         ("↑ ↓  ^K ^J", "move (PgUp PgDn Home End)"),
@@ -2456,6 +2713,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         ("F2", "security settings (timeout, pin, system unlock)"),
         ("^W  Alt-⌫", "delete word, clear filter"),
         ("Esc  ^C", "clear filter / quit"),
+        ("mouse", "click selects, double or right click = Enter"),
     ];
     let mut lines: Vec<Line> = rows
         .iter()
@@ -2476,7 +2734,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         ),
         Style::new().fg(DIM),
     )));
-    draw_popup(f, area, "rbw-enhanced", lines);
+    draw_popup(f, area, "rbw-enhanced", lines)
 }
 
 fn host(uri: &str) -> String {

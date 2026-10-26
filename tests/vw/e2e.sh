@@ -496,6 +496,39 @@ if command -v tmux >/dev/null; then
     for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
     check "Esc quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
 
+    # the mouse: SGR reports, as the terminal sends them; at "x;y" (1-based)
+    # of the first match of a text on the screen
+    pos() { screen | awk -v p="$1" '(i = index($0, p)) { print i ";" NR; exit }'; }
+    press() { tmux send-keys -t rbw-e2e -l $'\e[<'"$1;$2M"$'\e[<'"$1;$2m"; sleep 0.3; }
+    # the wheel has no release
+    wheel() { tmux send-keys -t rbw-e2e -l $'\e[<'"$1;$2M"; sleep 0.3; }
+    click() { press 0 "$(pos "$1")"; }
+    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env PATH='$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    wait_screen "/$(rbw list | wc -l)\$" >/dev/null
+    click ' Favorites'
+    check "mouse: a click on the sidebar opens the view" 0 "$(wait_screen '╭ Favorites ─' ; echo $?)"
+    click ' All items'
+    check "  and back to all items" 0 "$(wait_screen '╭ All items ─' ; echo $?)"
+    first=$(screen | grep -n '▌' | head -1 | cut -d: -f1)
+    wheel 65 '40;10'
+    wheel 65 '40;10'
+    check "  the wheel moves the selection" $((first + 2)) "$(screen | grep -n '▌' | head -1 | cut -d: -f1)"
+    tmux send-keys -t rbw-e2e 'flags'
+    wait_screen ' 1/' >/dev/null
+    # the list row, not the filter
+    press 2 "$(pos '▌flags')"
+    check "  a right click opens the actions" 0 "$(wait_screen 'type password  *Alt+P' ; echo $?)"
+    press 0 '2;1'
+    check "  a click outside closes them" 0 "$(screen | grep -c 'type password  *Alt+P')"
+    click '▌flags'
+    click '▌flags'
+    check "  so does a double click" 0 "$(wait_screen 'type password  *Alt+P' ; echo $?)"
+    was=$(item flags .favorite)
+    click ' the favorites'
+    check "  a click on a row does it" 0 "$(wait_screen 'ed to the favorites\|ed from the favorites' ; echo $?)"
+    check "  on the server" "$([ "$was" = true ] && echo false || echo true)" "$(item flags .favorite)"
+    tmux kill-session -t rbw-e2e 2>/dev/null || true
+
     # typing: a fake Hyprland that logs where the focus goes, a fake dotool
     # that logs what it types
     mkdir -p "$WORK/typer"

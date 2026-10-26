@@ -17,7 +17,7 @@ official apps. Based on [rbw](https://github.com/doy/rbw) by Jesse Luehrs.
 * **Replaces the official desktop client** for daily use, and **rofi-rbw** if
   you like: the TUI copies and also types credentials into the previous
   window.
-* Tested against Vaultwarden 1.37: `tests/vw/e2e.sh` runs 144 checks against
+* Tested against Vaultwarden 1.37: `tests/vw/e2e.sh` runs 152 checks against
   a throwaway server and verifies every write with an independent decryptor.
 
 ![rbw tui](docs/screenshots/main.png)
@@ -57,6 +57,10 @@ most come first.
 | `^G` | password generator |
 | `^R` `^O` `^S` `^L` | show secrets, open the URL, sync, lock |
 | `F2` | security settings, see below |
+
+The mouse works too: a click selects, a double or right click opens the
+actions, the wheel scrolls; in a popup a click on the selected row changes
+it. Shift+drag still selects text in most terminals.
 
 ![actions](docs/screenshots/actions.png)
 ![new item](docs/screenshots/new-item.png)
