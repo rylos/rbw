@@ -1,8 +1,9 @@
-// The tui's security settings, laid out like the official clients' (session
-// timeout, timeout action, unlock with pin, unlock with system
-// authentication, master password on restart). Every change is saved right
-// away with `rbw config set` and friends, so the cli and the tui never
-// disagree, and the running agent picks it up without restarting.
+// The tui's settings: the security ones laid out like the official
+// clients' (session timeout, timeout action, unlock with pin, unlock with
+// system authentication, master password on restart), then the folder the
+// tui saves attachments in. Every change is saved right away with `rbw
+// config set` and friends, so the cli and the tui never disagree, and the
+// running agent picks it up without restarting.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Timeout {
@@ -26,7 +27,10 @@ const TIMEOUTS: &[Timeout] = &[
     Timeout::Restart,
 ];
 
-pub const ROWS: usize = 7;
+pub const ROWS: usize = 8;
+
+// edited as text, not changed with the arrows like the rows above
+pub const ATTACHMENTS_ROW: usize = 7;
 
 pub struct Settings {
     pub timeout: Timeout,
@@ -37,6 +41,9 @@ pub struct Settings {
     pub saved_password: bool,
     pub auto_unlock: bool,
     pub tui_auth: bool,
+    pub attachments_dir: Option<std::path::PathBuf>,
+    // where they actually go
+    pub attachments_path: std::path::PathBuf,
 }
 
 impl Settings {
@@ -65,6 +72,8 @@ impl Settings {
             saved_password: config.saved_password.is_some(),
             auto_unlock: config.auto_unlock,
             tui_auth: config.tui_auth,
+            attachments_path: config.attachments_dir(),
+            attachments_dir: config.attachments_dir,
         }
     }
 
@@ -114,9 +123,13 @@ impl Settings {
                 "unlock with the saved password without asking: the vault \
                   is open from the desktop login (rofi, scripts)"
             }
-            _ => {
+            6 => {
                 "rbw tui asks polkit (face, fingerprint) once per login \
                   session; rbw get and rofi are not affected"
+            }
+            _ => {
+                "where Enter on an attachment saves it; empty is your \
+                  download folder (XDG_DOWNLOAD_DIR)"
             }
         }
     }
@@ -224,9 +237,11 @@ pub fn change(settings: &Settings, row: usize, step: isize) -> Change {
                 }))
             }
         }
-        _ => Change::Done(
+        6 => Change::Done(
             set("tui_auth", if settings.tui_auth { "false" } else { "true" })
                 .map(|()| "tui authentication saved".to_string()),
         ),
+        // the attachments folder is typed, see ATTACHMENTS_ROW
+        _ => Change::Done(Ok(String::new())),
     }
 }

@@ -1318,6 +1318,10 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.sort_by_usage = parse_bool(value)
                 .context("failed to parse value for sort_by_usage")?;
         }
+        "attachments_dir" => {
+            config.attachments_dir = (!value.is_empty())
+                .then(|| std::path::PathBuf::from(value));
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1350,6 +1354,7 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
             config.timeout_action = rbw::config::TimeoutAction::default();
         }
         "sort_by_usage" => config.sort_by_usage = false,
+        "attachments_dir" => config.attachments_dir = None,
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1368,6 +1373,8 @@ const LIVE_KEYS: &[&str] = &[
     "tui_auth",
     "sort_by_usage",
     "notify",
+    // read by the tui when it saves, the agent doesn't use it
+    "attachments_dir",
 ];
 
 fn apply_config(key: &str) -> anyhow::Result<()> {
@@ -3967,7 +3974,13 @@ pub struct TuiDetails {
     pub values: Vec<TuiValue>,
     pub notes: Option<String>,
     pub history: usize,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<TuiAttachment>,
+}
+
+#[derive(Clone)]
+pub struct TuiAttachment {
+    pub id: String,
+    pub name: String,
 }
 
 // decrypts everything, so for entries with master password reprompt this
@@ -3996,7 +4009,10 @@ pub fn tui_details(db: &rbw::db::Db, id: &str) -> anyhow::Result<TuiDetails> {
         attachments: decrypted
             .attachments
             .iter()
-            .map(|a| a.file_name.clone().unwrap_or_else(|| a.id.clone()))
+            .map(|a| TuiAttachment {
+                id: a.id.clone(),
+                name: a.file_name.clone().unwrap_or_else(|| a.id.clone()),
+            })
             .collect(),
     };
     match &decrypted.data {

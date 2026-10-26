@@ -8,6 +8,8 @@
 // Ctrl with a letter copies (P password, U username, T totp), Alt with the
 // same letter types it into the previous window instead (typer.rs) and quits,
 // like rofi-rbw. Enter opens a menu with these and the other actions.
+// Attachments are rows of the details too: Enter saves one in the
+// attachments folder (F2) or opens it with the default application.
 // The mouse works too: a click selects, a double click (or a right click)
 // does what Enter does, the wheel scrolls; in a popup a click on the
 // selected row changes it and a click outside closes it.
@@ -27,13 +29,16 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use crate::commands::{TuiDetails, TuiEntry, TuiVault};
+use crate::commands::{TuiAttachment, TuiDetails, TuiEntry, TuiVault};
 use crate::views::{Row, View};
 
 const CLIPBOARD_SECONDS: u64 = 30;
 const MESSAGE_SECONDS: u64 = 4;
 const DOUBLE_CLICK: std::time::Duration =
     std::time::Duration::from_millis(400);
+
+// the label of the attachment rows in detail_lines()
+const ATTACHMENT: &str = "📎";
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -73,6 +78,8 @@ enum Mode {
     // the list of choices for the selected row of the new item popup
     Pick(NewForm, Picker),
     Generator,
+    // the attachments folder being typed in the settings
+    EditDir(String),
 }
 
 // what a row of the actions menu does: the same as a key, or copying and
@@ -82,6 +89,9 @@ enum Act {
     Key(KeyCode, KeyModifiers),
     CopyField,
     TypeField,
+    SaveAttachment,
+    OpenAttachment,
+    SaveAttachments,
 }
 
 struct Picker {
@@ -558,7 +568,75 @@ impl App {
         if let Some(notes) = &details.notes {
             lines.push(("notes".to_string(), notes.clone(), true));
         }
+        for attachment in &details.attachments {
+            lines.push((ATTACHMENT.to_string(), attachment.name.clone(), false));
+        }
         lines
+    }
+
+    // the attachment on a row of detail_lines(), if it is one (they come
+    // last)
+    fn attachment_at(&self, line: usize) -> Option<TuiAttachment> {
+        let details = self.details.get(&self.selected()?.id)?;
+        let first = self
+            .detail_lines()
+            .len()
+            .checked_sub(details.attachments.len())?;
+        details.attachments.get(line.checked_sub(first)?).cloned()
+    }
+
+    // saves (or opens) attachments of the selected entry. An entry with
+    // master password reprompt asks for it again in the agent, so then the
+    // terminal is handed to the pinentry like for an edit.
+    fn attachments_job(
+        &mut self,
+        attachments: Vec<TuiAttachment>,
+        open: bool,
+    ) -> Outcome {
+        let Some(entry) = self.selected() else {
+            return Outcome::None;
+        };
+        if attachments.is_empty() {
+            let msg = format!("{} has no attachments", entry.name);
+            self.message(msg, true);
+            return Outcome::None;
+        }
+        let (id, reprompt) = (entry.id.clone(), entry.reprompt);
+        let job = move || -> anyhow::Result<String> {
+            if open {
+                let mut names = vec![];
+                for a in &attachments {
+                    crate::items::attachment_open_id(&id, &a.id, &a.name)?;
+                    names.push(a.name.clone());
+                }
+                return Ok(format!("opened {}", names.join(", ")));
+            }
+            let dir = rbw::config::Config::load()
+                .unwrap_or_default()
+                .attachments_dir();
+            let mut saved = vec![];
+            for a in &attachments {
+                saved.push(crate::items::attachment_save_id(
+                    &id, &a.id, &a.name, &dir,
+                )?);
+            }
+            Ok(match saved.as_slice() {
+                [one] => format!("saved {}", tilde(one)),
+                _ => format!(
+                    "saved {} attachments in {}",
+                    saved.len(),
+                    tilde(&dir)
+                ),
+            })
+        };
+        if reprompt {
+            return Outcome::Suspend(Box::new(job));
+        }
+        match job() {
+            Ok(msg) => self.message(msg, false),
+            Err(e) => self.message(format!("{e:#}"), true),
+        }
+        Outcome::None
     }
 
     fn copy(&mut self, what: &str, value: Option<String>) {
@@ -625,6 +703,7 @@ impl App {
             Mode::New(form) => return self.new_key(key, form),
             Mode::Actions(row) => return self.actions_key(key, row),
             Mode::Generator => return self.generator_key(key),
+            Mode::EditDir(dir) => return self.edit_dir_key(key, dir),
             Mode::Pick(form, picker) => {
                 return self.pick_key(key, form, picker)
             }
@@ -762,6 +841,13 @@ impl App {
             KeyCode::Char('j') if ctrl => self.move_by(1),
             KeyCode::PageUp => self.move_by(-10),
             KeyCode::PageDown => self.move_by(10),
+            KeyCode::Home if self.focus == Focus::Details => {
+                self.detail_line = 0;
+            }
+            KeyCode::End if self.focus == Focus::Details => {
+                self.detail_line =
+                    self.detail_lines().len().saturating_sub(1);
+            }
             KeyCode::Home if self.focus == Focus::List => {
                 self.list.select((!self.filtered.is_empty()).then_some(0));
                 self.on_select();
@@ -1116,11 +1202,15 @@ impl App {
                     }
                 }
                 Mode::Settings(row) => {
-                    // a blank line after the first two rows
+                    // a blank line after the first two rows, and one
+                    // before the attachments folder
+                    let last = crate::settings::ATTACHMENTS_ROW;
                     let clicked = match line {
                         0 | 1 => Some(line),
                         2 => None,
-                        _ => Some(line - 1),
+                        l if l <= last => Some(l - 1),
+                        l if l == last + 1 => None,
+                        l => Some(l - 2),
                     }
                     .filter(|&r| r < crate::settings::ROWS);
                     match clicked {
@@ -1547,6 +1637,23 @@ impl App {
         let none = KeyModifiers::NONE;
         let (ctrl, alt) = (KeyModifiers::CONTROL, KeyModifiers::ALT);
         if self.focus == Focus::Details {
+            if let Some(attachment) = self.attachment_at(self.detail_line) {
+                let dir = rbw::config::Config::load()
+                    .unwrap_or_default()
+                    .attachments_dir();
+                return vec![
+                    (
+                        format!("save {} in {}", attachment.name, tilde(&dir)),
+                        "",
+                        Act::SaveAttachment,
+                    ),
+                    (
+                        format!("open {}", attachment.name),
+                        "",
+                        Act::OpenAttachment,
+                    ),
+                ];
+            }
             let field = self
                 .detail_lines()
                 .get(self.detail_line)
@@ -1611,6 +1718,24 @@ impl App {
             "Tab",
             Act::Key(KeyCode::Tab, none),
         ));
+        let attachments = details.map_or(0, |d| d.attachments.len());
+        if attachments > 0 {
+            let dir = rbw::config::Config::load()
+                .unwrap_or_default()
+                .attachments_dir();
+            rows.push((
+                if attachments == 1 {
+                    format!("save the attachment in {}", tilde(&dir))
+                } else {
+                    format!(
+                        "save the {attachments} attachments in {}",
+                        tilde(&dir)
+                    )
+                },
+                "",
+                Act::SaveAttachments,
+            ));
+        }
         rows.push((
             "edit".to_string(),
             "^E",
@@ -1645,6 +1770,24 @@ impl App {
         match act {
             Act::Key(code, modifiers) => {
                 self.handle_key(KeyEvent::new(code, modifiers))
+            }
+            Act::SaveAttachment | Act::OpenAttachment => {
+                let Some(attachment) = self.attachment_at(self.detail_line)
+                else {
+                    return Outcome::None;
+                };
+                self.attachments_job(
+                    vec![attachment],
+                    matches!(act, Act::OpenAttachment),
+                )
+            }
+            Act::SaveAttachments => {
+                let attachments = self
+                    .selected()
+                    .and_then(|e| self.details.get(&e.id))
+                    .map(|d| d.attachments.clone())
+                    .unwrap_or_default();
+                self.attachments_job(attachments, false)
             }
             Act::CopyField | Act::TypeField => {
                 let lines = self.detail_lines();
@@ -1706,6 +1849,15 @@ impl App {
                 return Outcome::None;
             }
         };
+        if row == crate::settings::ATTACHMENTS_ROW {
+            let dir = rbw::config::Config::load()
+                .unwrap_or_default()
+                .attachments_dir
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.mode = Mode::EditDir(dir);
+            return Outcome::None;
+        }
         self.mode = Mode::Settings(row);
         let settings = crate::settings::Settings::load();
         match crate::settings::change(&settings, row, step) {
@@ -1719,6 +1871,52 @@ impl App {
             }
             crate::settings::Change::Prompt(f) => Outcome::Suspend(f),
         }
+    }
+
+    fn edit_dir_key(&mut self, key: KeyEvent, mut dir: String) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Settings(crate::settings::ATTACHMENTS_ROW);
+            }
+            KeyCode::Enter => {
+                let dir = dir.trim();
+                let res = if dir.is_empty() {
+                    crate::commands::config_unset("attachments_dir")
+                } else {
+                    crate::commands::config_set("attachments_dir", dir)
+                };
+                match res {
+                    Ok(()) => self.message(
+                        format!(
+                            "attachments are saved in {}",
+                            tilde(
+                                &rbw::config::Config::load()
+                                    .unwrap_or_default()
+                                    .attachments_dir()
+                            )
+                        ),
+                        false,
+                    ),
+                    Err(e) => self.message(format!("{e:#}"), true),
+                }
+                self.mode = Mode::Settings(crate::settings::ATTACHMENTS_ROW);
+            }
+            KeyCode::Char('u') if ctrl => {
+                dir.clear();
+                self.mode = Mode::EditDir(dir);
+            }
+            KeyCode::Backspace => {
+                dir.pop();
+                self.mode = Mode::EditDir(dir);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                dir.push(c);
+                self.mode = Mode::EditDir(dir);
+            }
+            _ => self.mode = Mode::EditDir(dir),
+        }
+        Outcome::None
     }
 
     fn check_lock(&mut self) {
@@ -1795,6 +1993,7 @@ impl App {
             Mode::New(form) => Some(self.draw_new(f, area, form)),
             Mode::Actions(row) => Some(self.draw_actions(f, area, *row)),
             Mode::Generator => Some(self.draw_generator(f, area)),
+            Mode::EditDir(dir) => Some(draw_edit_dir(f, area, dir)),
             Mode::Pick(form, picker) => {
                 Some(self.draw_pick(f, area, form, picker))
             }
@@ -2025,7 +2224,16 @@ impl App {
                     format!("{label:>label_w$}  "),
                     Style::new().fg(DIM),
                 )];
-                if label == "totp" {
+                if label == ATTACHMENT {
+                    if n == 0 || values[n - 1].0 != ATTACHMENT {
+                        lines.push(Line::from(""));
+                        tags.resize(lines.len(), None);
+                    }
+                    lines.push(Line::from(Span::styled(
+                        format!("{ATTACHMENT} {value}"),
+                        style,
+                    )));
+                } else if label == "totp" {
                     let left = details
                         .totp
                         .as_ref()
@@ -2086,12 +2294,6 @@ impl App {
                     Style::new().fg(DIM),
                 )));
             }
-            for name in &details.attachments {
-                lines.push(Line::from(Span::styled(
-                    format!("📎 {name}"),
-                    Style::new().fg(DIM),
-                )));
-            }
         } else if let Some(err) = &self.detail_error {
             lines.push(Line::from(Span::styled(
                 err.clone(),
@@ -2131,9 +2333,24 @@ impl App {
             }
             y = y.saturating_add(h);
         }
+        // scrolled just enough to show the selected field (entries can have
+        // dozens of uris, with the attachments after them)
+        let bottom = area.y + area.height.saturating_sub(1);
+        let scroll = fields
+            .iter()
+            .find(|(_, _, n)| {
+                self.focus == Focus::Details && *n == self.detail_line
+            })
+            .map_or(0, |(y, h, _)| (y + h).saturating_sub(bottom));
+        let fields = fields
+            .into_iter()
+            .filter(|(y, _, _)| y.saturating_sub(scroll) > area.y)
+            .map(|(y, h, n)| (y - scroll, h, n))
+            .collect();
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
                 .block(pane(border, &entry.name)),
             area,
         );
@@ -2153,7 +2370,11 @@ impl App {
             || "field".to_string(),
             |(label, _, _)| label.clone(),
         );
-        let field_actions = format!("copy or type {field}");
+        let field_actions = if field == ATTACHMENT {
+            "save or open the attachment".to_string()
+        } else {
+            format!("copy or type {field}")
+        };
         let copy_main = format!(
             "copy {}",
             primary_label(self.selected().map(|e| e.kind))
@@ -2651,6 +2872,15 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) -> Rect {
             String::new(),
             true,
         ),
+        (
+            "Attachments folder".to_string(),
+            if settings.attachments_dir.is_some() {
+                tilde(&settings.attachments_path)
+            } else {
+                format!("{} (downloads)", tilde(&settings.attachments_path))
+            },
+            true,
+        ),
     ];
     let mut lines = vec![];
     for (n, (label, value, enabled)) in rows.iter().enumerate() {
@@ -2668,7 +2898,7 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) -> Rect {
             Span::styled(format!("{label:<22}"), style),
             Span::styled(value.clone(), style.fg(ACCENT)),
         ]));
-        if n == 1 {
+        if n == 1 || n + 1 == crate::settings::ATTACHMENTS_ROW {
             lines.push(Line::from(""));
         }
     }
@@ -2686,7 +2916,49 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) -> Rect {
         "Esc".bold().fg(ACCENT),
         " close".fg(DIM),
     ]));
-    draw_popup(f, area, "Security", lines)
+    draw_popup(f, area, "Settings", lines)
+}
+
+fn draw_edit_dir(f: &mut ratatui::Frame, area: Rect, dir: &str) -> Rect {
+    let downloads = rbw::config::Config {
+        attachments_dir: None,
+        ..rbw::config::Config::default()
+    }
+    .attachments_dir();
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(dir.to_string(), Style::new().bold()),
+            Span::styled("█", Style::new().fg(ACCENT)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "empty: your download folder ({}); ~ is your home",
+                tilde(&downloads)
+            ),
+            Style::new().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            "Enter".bold().fg(ACCENT),
+            " save  ".fg(DIM),
+            "^U".bold().fg(ACCENT),
+            " clear  ".fg(DIM),
+            "Esc".bold().fg(ACCENT),
+            " cancel".fg(DIM),
+        ]),
+    ];
+    draw_popup(f, area, "Attachments folder", lines)
+}
+
+// a path with the home shortened to ~, for messages
+fn tilde(path: &std::path::Path) -> String {
+    let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 fn draw_help(f: &mut ratatui::Frame, area: Rect) -> Rect {
@@ -2696,6 +2968,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) -> Rect {
         ("Enter", "actions on the entry (or the field)"),
         ("^P", "copy password (card number, note, public key)"),
         ("Tab →", "pick a field, Enter copies or types it"),
+        ("", "on an attachment, Enter saves or opens it"),
         ("^U  ^T", "copy username, totp code"),
         (
             "Alt+P Alt+U Alt+T",
@@ -2710,7 +2983,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) -> Rect {
         ("^G", "password generator"),
         ("^S", "sync"),
         ("^L", "lock and quit"),
-        ("F2", "security settings (timeout, pin, system unlock)"),
+        ("F2", "settings (timeout, pin, system unlock, attachments)"),
         ("^W  Alt-⌫", "delete word, clear filter"),
         ("Esc  ^C", "clear filter / quit"),
         ("mouse", "click selects, double or right click = Enter"),

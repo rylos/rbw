@@ -15,6 +15,9 @@
 * `persistent_login` config option: log in again with the personal API key
   when the refresh token is rejected.
 * Desktop notification when the login expired (`notify` config option).
+* `rbw tui`: attachments can be saved (in the download folder, or
+  `attachments_dir`) or opened with the default application; `Home`/`End`
+  in the fields, and the details scroll to the selected field.
 
 ## Changed
 

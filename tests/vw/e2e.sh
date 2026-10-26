@@ -32,6 +32,11 @@ check() {
     else
         fail=$((fail + 1))
         echo "FAIL $desc"
+        # E2E_DUMP=dir: what the tui showed when a check failed
+        if [ -n "${E2E_DUMP:-}" ] && tmux has-session -t rbw-e2e 2>/dev/null; then
+            mkdir -p "$E2E_DUMP"
+            tmux capture-pane -p -t rbw-e2e >"$E2E_DUMP/$fail.txt"
+        fi
         echo "     expected: $expected"
         echo "     actual:   $actual"
     fi
@@ -426,8 +431,9 @@ check "and alphabetical without it" "$(rbw list | sort | head -1)" "$(rbw list |
 echo "== tui"
 if command -v tmux >/dev/null; then
     screen() { tmux capture-pane -p -t rbw-e2e 2>/dev/null; }
+    # $2: seconds to wait, 5 by default
     wait_screen() {
-        for _ in $(seq 1 50); do screen | grep -q -- "$1" && return 0; sleep 0.1; done
+        for _ in $(seq 1 $((${2:-5} * 10))); do screen | grep -q -- "$1" && return 0; sleep 0.1; done
         return 1
     }
     tmux kill-session -t rbw-e2e 2>/dev/null || true
@@ -442,7 +448,9 @@ if command -v tmux >/dev/null; then
     check "a lock elsewhere hides the details" 0 "$(wait_screen 'locked: Enter' ; echo $?)"
     check "  and the secrets are gone from the screen" 0 "$(screen | grep -c 'pw-api')"
     tmux send-keys -t rbw-e2e Tab
-    check "Tab unlocks again" 0 "$(wait_screen 'password' ; echo $?)"
+    # the master password key derivation (600000 rounds) is slow in a
+    # debug build: well over 5 s on a Ryzen 1800X
+    check "Tab unlocks again" 0 "$(wait_screen 'password' 60 ; echo $?)"
     # back from the fields, clear the filter
     # one at a time: escapes sent together read as alt sequences
     for _ in 1 2; do tmux send-keys -t rbw-e2e Escape; sleep 0.2; done
@@ -562,6 +570,51 @@ EOF
     tmux send-keys -t rbw-e2e M-u
     check "without Hyprland or niri it refuses to type" 0 "$(wait_screen 'typing needs Hyprland' ; echo $?)"
     tmux kill-session -t rbw-e2e 2>/dev/null || true
+
+    # attachments: saved in attachments_dir, never over an existing file;
+    # opened with a fake xdg-open that logs what it got
+    mkdir -p "$WORK/opener" "$WORK/dl"
+    printf '#!/bin/sh\necho "$1" >>%s/opened.log\n' "$WORK" >"$WORK/opener/xdg-open"
+    chmod +x "$WORK/opener/xdg-open"
+    rbw config set attachments_dir "$WORK/dl"
+    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env PATH='$WORK/opener:$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    wait_screen "/$(rbw list | wc -l)\$" >/dev/null
+    tmux send-keys -t rbw-e2e 'flags'
+    wait_screen ' 1/' >/dev/null
+    tmux send-keys -t rbw-e2e Enter
+    check "attachments: the entry menu saves them" 0 "$(wait_screen 'save the attachment in' ; echo $?)"
+    tmux send-keys -t rbw-e2e Escape
+    sleep 0.2
+    # the attachments are the last rows of the fields
+    tmux send-keys -t rbw-e2e Tab End Enter
+    check "  on an attachment row Enter offers save" 0 "$(wait_screen 'save bin.dat in' ; echo $?)"
+    tmux send-keys -t rbw-e2e Enter
+    check "  saved" 0 "$(wait_screen 'saved .*bin.dat' ; echo $?)"
+    check "  with the right contents" "$(sha256sum <"$WORK/bin.dat")" "$(sha256sum <"$WORK/dl/bin.dat" 2>/dev/null)"
+    tmux send-keys -t rbw-e2e Enter Enter
+    check "  a second save doesn't overwrite" 0 "$(wait_screen 'bin (1).dat' ; echo $?)"
+    check "  and is a copy" "$(sha256sum <"$WORK/bin.dat")" "$(sha256sum <"$WORK/dl/bin (1).dat" 2>/dev/null)"
+    check "  private files" 600 "$(stat -c %a "$WORK/dl/bin.dat")"
+    tmux send-keys -t rbw-e2e Enter Down Enter
+    check "  open" 0 "$(wait_screen 'opened bin.dat' ; echo $?)"
+    opened=$(tail -1 "$WORK/opened.log" 2>/dev/null)
+    check "  hands a decrypted copy to xdg-open" "$(sha256sum <"$WORK/bin.dat")" "$(sha256sum <"$opened" 2>/dev/null)"
+    check "  from a private directory" 700 "$(stat -c %a "$(dirname "$opened")" 2>/dev/null)"
+    rm -f "$opened"
+    tmux send-keys -t rbw-e2e Escape
+    sleep 0.2
+    tmux send-keys -t rbw-e2e F2
+    wait_screen '╭ Settings ─' >/dev/null
+    for _ in $(seq 1 7); do tmux send-keys -t rbw-e2e Down; done
+    tmux send-keys -t rbw-e2e Enter
+    check "  F2 edits the attachments folder" 0 "$(wait_screen '╭ Attachments folder ─' ; echo $?)"
+    tmux send-keys -t rbw-e2e C-u
+    tmux send-keys -t rbw-e2e -l "$WORK/dl2"
+    tmux send-keys -t rbw-e2e Enter
+    check "  and saves it" 0 "$(wait_screen 'attachments are saved in' ; echo $?)"
+    check "  in the config" "$WORK/dl2" "$(rbw config show | jq -r .attachments_dir)"
+    tmux kill-session -t rbw-e2e 2>/dev/null || true
+    rbw config unset attachments_dir
 else
     echo "skipped (no tmux)"
 fi

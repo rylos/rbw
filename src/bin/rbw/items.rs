@@ -1176,24 +1176,7 @@ pub fn attachment_get(
         .file_name
         .clone()
         .unwrap_or_else(|| chosen.id.clone());
-
-    let (key, data) = api_call(|client, access_token| {
-        client.download_attachment(access_token, &entry.id, &chosen.id)
-    })
-    .context("failed to download the attachment")?;
-    let key = key.or_else(|| {
-        entry
-            .attachments
-            .iter()
-            .find(|a| a.id == chosen.id)
-            .and_then(|a| a.key.clone())
-    });
-    let plaintext = crate::actions::decrypt_attachment(
-        &data,
-        key.as_deref(),
-        entry.key.as_deref(),
-        entry.org_id.as_deref(),
-    )?;
+    let plaintext = attachment_data(&entry, &chosen.id)?;
 
     let output = output.map_or_else(
         || {
@@ -1231,6 +1214,123 @@ pub fn attachment_get(
         eprintln!("saved {}", output.display());
     }
     Ok(())
+}
+
+// downloads an attachment of the entry and decrypts it in the agent
+fn attachment_data(
+    entry: &rbw::db::Entry,
+    attachment_id: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let (key, data) = api_call(|client, access_token| {
+        client.download_attachment(access_token, &entry.id, attachment_id)
+    })
+    .context("failed to download the attachment")?;
+    let key = key.or_else(|| {
+        entry
+            .attachments
+            .iter()
+            .find(|a| a.id == attachment_id)
+            .and_then(|a| a.key.clone())
+    });
+    crate::actions::decrypt_attachment(
+        &data,
+        key.as_deref(),
+        entry.key.as_deref(),
+        entry.org_id.as_deref(),
+    )
+}
+
+// Saves an attachment of the entry with this id in dir (created if needed)
+// and returns the path. An existing file is never overwritten: the copy
+// becomes "name (1).ext", "name (2).ext" and so on.
+pub fn attachment_save_id(
+    id: &str,
+    attachment_id: &str,
+    file_name: &str,
+    dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let db = crate::commands::load_db()?;
+    let entry = db
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
+    let data = attachment_data(entry, attachment_id)?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    write_new_file(dir, file_name, attachment_id, &data)
+}
+
+// Decrypts an attachment into a private directory (in memory where
+// XDG_RUNTIME_DIR is, gone at logout) and opens it with the default
+// application.
+pub fn attachment_open_id(
+    id: &str,
+    attachment_id: &str,
+    file_name: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let dir = rbw::dirs::attachments_tmp_dir()?;
+    let path = attachment_save_id(id, attachment_id, file_name, &dir)?;
+    open::that_detached(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(path)
+}
+
+// writes data to a file in dir that doesn't exist yet, named after
+// file_name (only its last component, so a name from the server can't
+// leave dir) or, without one, after the attachment id
+fn write_new_file(
+    dir: &std::path::Path,
+    file_name: &str,
+    attachment_id: &str,
+    data: &[u8],
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let name = std::path::Path::new(file_name)
+        .file_name()
+        .map_or_else(|| attachment_id.into(), std::ffi::OsStr::to_os_string);
+    let path = std::path::Path::new(&name);
+    let stem = path
+        .file_stem()
+        .map_or_else(|| name.clone(), std::ffi::OsStr::to_os_string);
+    let ext = path.extension().map(std::ffi::OsStr::to_os_string);
+    for n in 0..1000 {
+        let mut candidate = stem.clone();
+        if n > 0 {
+            candidate.push(format!(" ({n})"));
+        }
+        if let Some(ext) = &ext {
+            candidate.push(".");
+            candidate.push(ext);
+        }
+        let target = dir.join(candidate);
+        // create_new: no race with a file appearing in the meantime
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)
+        {
+            Ok(mut fh) => {
+                fh.write_all(data).with_context(|| {
+                    format!("failed to write {}", target.display())
+                })?;
+                return Ok(target);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to create {}", target.display())
+                })
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "too many files named like {} in {}",
+        name.to_string_lossy(),
+        dir.display()
+    ))
 }
 
 pub fn attachment_add(
@@ -1726,6 +1826,24 @@ mod tests {
             ],
             notes: Some("# not a comment\n\nsecond paragraph".to_string()),
         }
+    }
+
+    #[test]
+    fn test_write_new_file_never_overwrites() {
+        let dir = std::env::temp_dir()
+            .join(format!("rbw-attach-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = write_new_file(&dir, "report.pdf", "id1", b"a").unwrap();
+        let second = write_new_file(&dir, "report.pdf", "id1", b"b").unwrap();
+        let third = write_new_file(&dir, "../../etc/x", "id2", b"c").unwrap();
+        let bare = write_new_file(&dir, "", "id3", b"d").unwrap();
+        assert_eq!(first, dir.join("report.pdf"));
+        assert_eq!(second, dir.join("report (1).pdf"));
+        assert_eq!(third, dir.join("x"));
+        assert_eq!(bare, dir.join("id3"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"a");
+        assert_eq!(std::fs::read(&second).unwrap(), b"b");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

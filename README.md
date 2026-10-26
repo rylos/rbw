@@ -49,14 +49,21 @@ most come first.
 |---|---|
 | `^P` `^U` `^T` | copy password, username, TOTP code (cleared after 30 s) |
 | `Alt+P` `Alt+U` `Alt+T` | type them into the previous window and quit, like rofi-rbw |
-| `Enter` | menu with every action on the entry; on a field (`Tab`), copy or type it |
+| `Enter` | menu with every action on the entry; on a field (`Tab`), copy or type it; on an attachment, save or open it |
 | `←` | sidebar: favorites, types, vaults, collections, folders, archive, trash |
 | `^N` | new item: login, card, identity, secure note or SSH key, in your vault or an organization's collection |
 | `^E` `^D` | edit in your editor, move to the trash |
 | `^F` `^A` | favorite, archive |
 | `^G` | password generator |
 | `^R` `^O` `^S` `^L` | show secrets, open the URL, sync, lock |
-| `F2` | security settings, see below |
+| `F2` | settings: security (see below) and the attachments folder |
+
+Attachments are the last rows of the fields (`Tab`, then `End`). Saving one
+puts it in your download folder (`XDG_DOWNLOAD_DIR`, or the one set with
+`F2` or `rbw config set attachments_dir`), and never over an existing file:
+the copy becomes `name (1).ext`. Opening one decrypts it in a private
+directory under `$XDG_RUNTIME_DIR`, gone at logout, and hands it to the
+default application.
 
 The mouse works too: a click selects, a double or right click opens the
 actions, the wheel scrolls; in a popup a click on the selected row changes

@@ -75,6 +75,14 @@ pub fn usage_file() -> std::path::PathBuf {
     data_dir().join("usage.json")
 }
 
+// private (0700) and in memory where XDG_RUNTIME_DIR is: attachments
+// decrypted there to be opened go away at logout
+pub fn attachments_tmp_dir() -> Result<std::path::PathBuf> {
+    let dir = runtime_dir().join("attachments");
+    create_dir_all_with_permissions(&dir, 0o700)?;
+    Ok(dir)
+}
+
 pub fn socket_file() -> std::path::PathBuf {
     runtime_dir().join("socket")
 }

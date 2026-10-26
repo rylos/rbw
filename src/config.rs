@@ -58,6 +58,9 @@ pub struct Config {
     // list the entries used most often and most recently first
     #[serde(default)]
     pub sort_by_usage: bool,
+    // where the tui saves attachments; unset, the user's download folder
+    #[serde(default)]
+    pub attachments_dir: Option<std::path::PathBuf>,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
     pub device_id: Option<String>,
@@ -86,6 +89,7 @@ impl Default for Config {
             auto_unlock: false,
             tui_auth: false,
             sort_by_usage: false,
+            attachments_dir: None,
             device_id: None,
         }
     }
@@ -160,6 +164,26 @@ pub fn default_pinentry() -> String {
 impl Config {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // attachments_dir with a leading ~ expanded, or else the download folder
+    // of the user (XDG_DOWNLOAD_DIR on Linux, ~/Downloads on macOS), or else
+    // the home
+    pub fn attachments_dir(&self) -> std::path::PathBuf {
+        let user_dirs = directories::UserDirs::new();
+        let home = user_dirs.as_ref().map(|d| d.home_dir().to_path_buf());
+        if let Some(dir) = &self.attachments_dir {
+            return match (dir.strip_prefix("~"), &home) {
+                (Ok(rest), Some(home)) => home.join(rest),
+                _ => dir.clone(),
+            };
+        }
+        user_dirs
+            .as_ref()
+            .and_then(directories::UserDirs::download_dir)
+            .map(std::path::Path::to_path_buf)
+            .or(home)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
     }
 
     pub fn load() -> Result<Self> {
