@@ -654,6 +654,20 @@ pub struct NewItem {
 }
 
 pub fn add(item: &NewItem) -> anyhow::Result<()> {
+    add_with(item, &mut |_| {})
+}
+
+// what the tui shows while an entry is added or edited: the terminal for
+// the editor, or else itself with a message while the server is asked
+pub enum Screen<'a> {
+    Terminal,
+    Busy(&'a str),
+}
+
+pub fn add_with(
+    item: &NewItem,
+    ui: &mut dyn FnMut(Screen),
+) -> anyhow::Result<()> {
     crate::commands::unlock()?;
 
     let login = item.kind == Kind::Login;
@@ -683,7 +697,8 @@ pub fn add(item: &NewItem) -> anyhow::Result<()> {
     if !item.changes.is_empty() || item.no_edit {
         item.changes.apply(&mut form)?;
     } else if interactive {
-        form = edit_form(&form, item.kind)?;
+        form = edit_form(&form, item.kind, ui)?;
+        ui(Screen::Busy("saving…"));
     } else {
         // the historical format: the first line of stdin is the password,
         // the rest are the notes
@@ -773,6 +788,28 @@ pub fn edit(
     ignore_case: bool,
     changes: &Changes,
 ) -> anyhow::Result<()> {
+    if !edit_with(
+        needle,
+        username,
+        folder,
+        ignore_case,
+        changes,
+        &mut |_| {},
+    )? {
+        eprintln!("no changes");
+    }
+    Ok(())
+}
+
+// see add_with; false when nothing changed
+pub fn edit_with(
+    needle: Needle,
+    username: Option<&str>,
+    folder: Option<&str>,
+    ignore_case: bool,
+    changes: &Changes,
+    ui: &mut dyn FnMut(Screen),
+) -> anyhow::Result<bool> {
     crate::commands::unlock()?;
 
     let (entry, _) = find(needle, username, folder, ignore_case)?;
@@ -785,7 +822,9 @@ pub fn edit(
         changes.apply(&mut new)?;
         new
     } else if std::io::stdin().is_terminal() {
-        edit_form(&old, item.kind())?
+        let new = edit_form(&old, item.kind(), ui)?;
+        ui(Screen::Busy(if new == old { "" } else { "saving…" }));
+        new
     } else {
         let (password, notes) = read_legacy_stdin(old.login.is_some())?;
         if password.is_none() && notes.is_none() {
@@ -807,8 +846,7 @@ pub fn edit(
     if let Some(favorite) = changes.favorite {
         item.json["favorite"] = serde_json::Value::Bool(favorite);
     } else if new == old {
-        eprintln!("no changes");
-        return Ok(());
+        return Ok(false);
     }
 
     let folder_id = if new.folder == old.folder {
@@ -820,7 +858,7 @@ pub fn edit(
     item.save()?;
 
     crate::actions::sync()?;
-    Ok(())
+    Ok(true)
 }
 
 pub fn remove(
@@ -1712,7 +1750,12 @@ fn login_values<'a>(
 
 // opens the editor until the contents parse, so that a typo doesn't throw
 // away what was written
-fn edit_form(form: &Form, kind: Kind) -> anyhow::Result<Form> {
+fn edit_form(
+    form: &Form,
+    kind: Kind,
+    ui: &mut dyn FnMut(Screen),
+) -> anyhow::Result<Form> {
+    ui(Screen::Terminal);
     let mut contents = render_form(form);
     loop {
         let edited = rbw::edit::edit(&contents, "")?;

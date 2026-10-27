@@ -30,6 +30,7 @@ use ratatui::widgets::{
 };
 
 use crate::commands::{TuiAttachment, TuiDetails, TuiEntry, TuiVault};
+use crate::items::Screen;
 use crate::views::{Row, View};
 
 const CLIPBOARD_SECONDS: u64 = 30;
@@ -198,8 +199,14 @@ struct App {
 }
 
 enum Outcome {
-    // a command that needs the real terminal (editor, pinentry)
-    Suspend(Box<dyn FnOnce() -> anyhow::Result<String>>),
+    // a command that needs the real terminal (editor, pinentry): it asks
+    // for it with Screen::Terminal, and with Screen::Busy gets the tui back
+    // with a message while it goes on (loading, saving)
+    Suspend(
+        Box<dyn FnOnce(&mut dyn FnMut(Screen)) -> anyhow::Result<String>>,
+    ),
+    // a request to the server: the message stays on screen while it runs
+    Work(String, Box<dyn FnOnce() -> anyhow::Result<String>>),
     // (what, value): typed into the previous window, then the tui quits
     Type(String, String),
     Reload,
@@ -569,7 +576,11 @@ impl App {
             lines.push(("notes".to_string(), notes.clone(), true));
         }
         for attachment in &details.attachments {
-            lines.push((ATTACHMENT.to_string(), attachment.name.clone(), false));
+            lines.push((
+                ATTACHMENT.to_string(),
+                attachment.name.clone(),
+                false,
+            ));
         }
         lines
     }
@@ -630,7 +641,10 @@ impl App {
             })
         };
         if reprompt {
-            return Outcome::Suspend(Box::new(job));
+            return Outcome::Suspend(Box::new(move |ui| {
+                ui(Screen::Terminal);
+                job()
+            }));
         }
         match job() {
             Ok(msg) => self.message(msg, false),
@@ -709,7 +723,7 @@ impl App {
             }
             Mode::ConfirmPurge(id) => {
                 if matches!(key.code, KeyCode::Char('y' | 'Y')) {
-                    return inline(self, move || {
+                    return inline("deleting…", move || {
                         crate::items::purge_id(&id)?;
                         Ok("deleted for good".to_string())
                     });
@@ -719,7 +733,7 @@ impl App {
             }
             Mode::ConfirmTrash(id) => {
                 if matches!(key.code, KeyCode::Char('y' | 'Y')) {
-                    return Outcome::Suspend(Box::new(move || {
+                    return inline("moving to the trash…", move || {
                         crate::items::remove(
                             crate::commands::parse_needle(&id).unwrap(),
                             None,
@@ -728,7 +742,7 @@ impl App {
                             false,
                         )?;
                         Ok("moved to the trash".to_string())
-                    }));
+                    });
                 }
                 self.message("not moved", false);
                 return Outcome::None;
@@ -775,7 +789,7 @@ impl App {
                         return Outcome::None;
                     };
                     let id = entry.id.clone();
-                    return inline(self, move || {
+                    return inline("restoring…", move || {
                         crate::items::restore_id(&id)?;
                         Ok("restored".to_string())
                     });
@@ -916,15 +930,18 @@ impl App {
             KeyCode::Char('e') if ctrl => {
                 if let Some(entry) = self.selected() {
                     let id = entry.id.clone();
-                    return Outcome::Suspend(Box::new(move || {
-                        crate::items::edit(
+                    return Outcome::Suspend(Box::new(move |ui| {
+                        ui(Screen::Busy("loading the entry…"));
+                        let saved = crate::items::edit_with(
                             crate::commands::parse_needle(&id).unwrap(),
                             None,
                             None,
                             false,
                             &crate::items::Changes::default(),
+                            ui,
                         )?;
-                        Ok("saved".to_string())
+                        Ok(if saved { "saved" } else { "no changes" }
+                            .to_string())
                     }));
                 }
             }
@@ -938,7 +955,7 @@ impl App {
             KeyCode::Char('f') if ctrl => {
                 if let Some(entry) = self.selected() {
                     let (id, favorite) = (entry.id.clone(), !entry.favorite);
-                    return inline(self, move || {
+                    return inline("saving…", move || {
                         crate::items::set_favorite(&id, favorite)?;
                         Ok(if favorite {
                             "added to the favorites"
@@ -952,7 +969,7 @@ impl App {
             KeyCode::Char('a') if ctrl => {
                 if let Some(entry) = self.selected() {
                     let (id, archive) = (entry.id.clone(), !entry.archived);
-                    return inline(self, move || {
+                    return inline("saving…", move || {
                         crate::items::set_archived(&id, archive)?;
                         Ok(if archive { "archived" } else { "unarchived" }
                             .to_string())
@@ -1060,16 +1077,48 @@ impl App {
                         }
                     }
                 }
+                Outcome::Work(busy, f) => {
+                    self.message(busy, false);
+                    term.draw(|f| self.draw(f))?;
+                    match f() {
+                        Ok(msg) => {
+                            self.message(msg, false);
+                            if let Err(e) = self.reload() {
+                                self.message(format!("{e:#}"), true);
+                            }
+                        }
+                        Err(e) => self.message(format!("{e:#}"), true),
+                    }
+                }
                 Outcome::Reload => {
                     if let Err(e) = self.reload() {
                         self.message(format!("{e:#}"), true);
                     }
                 }
                 Outcome::Suspend(f) => {
-                    leave()?;
-                    let res = f();
-                    *term = enter()?;
-                    term.clear()?;
+                    // best effort: an error shows up at the next draw
+                    let mut left = false;
+                    let res = f(&mut |screen| match screen {
+                        Screen::Terminal => {
+                            if !left {
+                                left = leave().is_ok();
+                            }
+                        }
+                        Screen::Busy(msg) => {
+                            if left {
+                                let Ok(t) = enter() else { return };
+                                *term = t;
+                                let _ = term.clear();
+                                left = false;
+                            }
+                            self.message(msg, false);
+                            let _ = term.draw(|f| self.draw(f));
+                        }
+                    });
+                    if left {
+                        *term = enter()?;
+                        term.clear()?;
+                    }
                     match res {
                         Ok(msg) => {
                             self.message(msg, false);
@@ -1561,20 +1610,23 @@ impl App {
             self.generator.value.clone()
         });
         let name = self.query.trim().to_string();
-        Outcome::Suspend(Box::new(move || {
-            crate::items::add(&crate::items::NewItem {
-                name,
-                username: None,
-                uris: vec![],
-                folder,
-                kind,
-                org,
-                collections,
-                password,
-                changes: crate::items::Changes::default(),
-                no_edit: false,
-                attach: vec![],
-            })?;
+        Outcome::Suspend(Box::new(move |ui| {
+            crate::items::add_with(
+                &crate::items::NewItem {
+                    name,
+                    username: None,
+                    uris: vec![],
+                    folder,
+                    kind,
+                    org,
+                    collections,
+                    password,
+                    changes: crate::items::Changes::default(),
+                    no_edit: false,
+                    attach: vec![],
+                },
+                ui,
+            )?;
             Ok("added".to_string())
         }))
     }
@@ -1643,7 +1695,11 @@ impl App {
                     .attachments_dir();
                 return vec![
                     (
-                        format!("save {} in {}", attachment.name, tilde(&dir)),
+                        format!(
+                            "save {} in {}",
+                            attachment.name,
+                            tilde(&dir)
+                        ),
                         "",
                         Act::SaveAttachment,
                     ),
@@ -1869,7 +1925,12 @@ impl App {
                 self.message(format!("{e:#}"), true);
                 Outcome::None
             }
-            crate::settings::Change::Prompt(f) => Outcome::Suspend(f),
+            crate::settings::Change::Prompt(f) => {
+                Outcome::Suspend(Box::new(move |ui| {
+                    ui(Screen::Terminal);
+                    f()
+                }))
+            }
         }
     }
 
@@ -2729,19 +2790,10 @@ fn choice_line(label: &str, value: &str, selected: bool) -> Line<'static> {
 
 // runs a quick server request without leaving the tui, then reloads
 fn inline(
-    app: &mut App,
-    f: impl FnOnce() -> anyhow::Result<String>,
+    busy: &str,
+    f: impl FnOnce() -> anyhow::Result<String> + 'static,
 ) -> Outcome {
-    match f() {
-        Ok(msg) => {
-            app.message(msg, false);
-            Outcome::Reload
-        }
-        Err(e) => {
-            app.message(format!("{e:#}"), true);
-            Outcome::None
-        }
-    }
+    Outcome::Work(busy.to_string(), Box::new(f))
 }
 
 fn truncate(s: &str, width: usize) -> String {
@@ -2953,8 +3005,12 @@ fn draw_edit_dir(f: &mut ratatui::Frame, area: Rect, dir: &str) -> Rect {
 
 // a path with the home shortened to ~, for messages
 fn tilde(path: &std::path::Path) -> String {
-    let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
-    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+    let home =
+        directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),

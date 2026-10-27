@@ -18,6 +18,10 @@
 * `rbw tui`: attachments can be saved (in the download folder, or
   `attachments_dir`) or opened with the default application; `Home`/`End`
   in the fields, and the details scroll to the selected field.
+* `rbw tui`: loading and saving an entry, moving it to the trash, restoring
+  it and the other server requests keep the tui on screen with a message;
+  the console only shows up for the editor.
+* The editor form in vim and nvim wraps long values and highlights the keys.
 
 ## Changed
 

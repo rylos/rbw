@@ -47,6 +47,11 @@ pub fn edit(contents: &str, help: &str) -> Result<String> {
                     // disable swap files and viminfo for password entry
                     editor_args.push(std::ffi::OsString::from("-ni"));
                     editor_args.push(std::ffi::OsString::from("NONE"));
+                    let script = dir.path().join("rbw.vim");
+                    if std::fs::write(&script, VIM_SCRIPT).is_ok() {
+                        editor_args.push(std::ffi::OsString::from("-S"));
+                        editor_args.push(script.into_os_string());
+                    }
                 }
                 _ => {
                     // other editor support welcomed
@@ -89,6 +94,22 @@ pub fn edit(contents: &str, help: &str) -> Result<String> {
 
     Ok(contents)
 }
+
+// run by vim and nvim after loading the file: long values (uris, keys,
+// notes) wrap also when the configuration turns wrapping off, and the keys
+// of the form are highlighted (the file has no known type: a real one, like
+// yaml, could bring formatters that rewrite it on save)
+const VIM_SCRIPT: &str = r"setlocal wrap filetype=rbw
+syntax match rbwComment /^#.*/
+syntax match rbwError /^# error: .*/
+syntax match rbwKey /^[^#:]\+:/
+syntax region rbwNotes start=/^--- notes ---$/ end=/\%$/ contains=rbwSeparator
+syntax match rbwSeparator /^--- notes ---$/ contained
+highlight default link rbwComment Comment
+highlight default link rbwError Error
+highlight default link rbwKey Identifier
+highlight default link rbwSeparator Title
+";
 
 fn contains_shell_metacharacters(cmd: &std::ffi::OsStr) -> bool {
     cmd.to_str()

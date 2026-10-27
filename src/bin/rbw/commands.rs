@@ -1319,8 +1319,8 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
                 .context("failed to parse value for sort_by_usage")?;
         }
         "attachments_dir" => {
-            config.attachments_dir = (!value.is_empty())
-                .then(|| std::path::PathBuf::from(value));
+            config.attachments_dir =
+                (!value.is_empty()).then(|| std::path::PathBuf::from(value));
         }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
