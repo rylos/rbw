@@ -28,6 +28,7 @@ official apps. Based on [rbw](https://github.com/doy/rbw) by Jesse Luehrs.
 |---|---|
 | Arch Linux | [`rbw-enhanced`](https://aur.archlinux.org/packages/rbw-enhanced) from the AUR (replaces `rbw`) |
 | From source | `cargo build --release`, then copy `target/release/rbw` and `rbw-agent` to your `PATH` |
+| Windows | not natively: the agent needs Unix sockets and `fork`. Use WSL2 and install it there as on Linux, with `pinentry-curses` as the pinentry |
 
 The client and the agent must come from the same build: after upgrading, run
 `rbw stop-agent`.
