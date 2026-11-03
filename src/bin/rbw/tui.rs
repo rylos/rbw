@@ -161,8 +161,54 @@ struct Hits {
     // (y, height, index in detail_lines()) of the fields
     fields: Vec<(u16, u16, usize)>,
     popup: Option<Rect>,
+    // the rows of the notes when they are shown: (y, line of the notes,
+    // first char of the row in that line, text of the row), from x0
+    notes: Vec<(u16, usize, usize, String)>,
+    notes_x: u16,
     // the whole frame
     area: Rect,
+}
+
+// text of the notes selected with the mouse: (line, char) of where the drag
+// started and of where it is now, both included
+struct NotesSel {
+    id: String,
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+    dragging: bool,
+}
+
+impl NotesSel {
+    fn range(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    // the selected chars of a line, as a range of char indexes
+    fn on_line(&self, line: usize, len: usize) -> Option<(usize, usize)> {
+        let ((l1, c1), (l2, c2)) = self.range();
+        if line < l1 || line > l2 {
+            return None;
+        }
+        let start = if line == l1 { c1 } else { 0 };
+        let end = if line == l2 { (c2 + 1).min(len) } else { len };
+        Some((start.min(len), end))
+    }
+
+    fn text(&self, notes: &str) -> String {
+        let ((l1, _), (l2, _)) = self.range();
+        let mut out = vec![];
+        for (n, line) in notes.lines().enumerate().take(l2 + 1).skip(l1) {
+            let chars: Vec<char> = line.chars().collect();
+            if let Some((a, b)) = self.on_line(n, chars.len()) {
+                out.push(chars[a..b].iter().collect::<String>());
+            }
+        }
+        out.join("\n")
+    }
 }
 
 struct App {
@@ -196,6 +242,10 @@ struct App {
     hits: Hits,
     // (when, column, row) of the last left click, for double clicks
     last_click: Option<(std::time::Instant, u16, u16)>,
+    notes_sel: Option<NotesSel>,
+    // (entry, lines) the details are scrolled by: kept between frames, so
+    // that a click doesn't move what is under the pointer
+    detail_scroll: (String, u16),
 }
 
 enum Outcome {
@@ -313,6 +363,8 @@ impl App {
             quit: false,
             hits: Hits::default(),
             last_click: None,
+            notes_sel: None,
+            detail_scroll: (String::new(), 0),
         };
         app.refilter();
         Ok(app)
@@ -1139,6 +1191,31 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<KeyEvent> {
         let at = Position::new(mouse.column, mouse.row);
         let key = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let to = self.notes_at(at, true);
+                if let (Some(sel), Some(to)) = (&mut self.notes_sel, to) {
+                    if sel.dragging {
+                        sel.cursor = to;
+                    }
+                }
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let moved = self.notes_sel.as_mut().is_some_and(|sel| {
+                    std::mem::replace(&mut sel.dragging, false)
+                        && sel.anchor != sel.cursor
+                });
+                if moved {
+                    self.copy_notes_sel();
+                }
+                return None;
+            }
+            MouseEventKind::Down(_) => {
+                self.notes_sel = None;
+            }
+            _ => {}
+        }
         let double = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let double = self.last_click.is_some_and(|(when, x, y)| {
@@ -1229,12 +1306,93 @@ impl App {
                 .map(|(_, _, n)| *n)?;
             self.focus = Focus::Details;
             self.detail_line = field;
+            // on the text of the notes: a drag selects some of it, a double
+            // click a word
+            let left = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+            if let (true, Some(pos)) = (left, self.notes_at(at, false)) {
+                let id = self.selected().map(|e| e.id.clone())?;
+                let mut sel = NotesSel {
+                    id,
+                    anchor: pos,
+                    cursor: pos,
+                    dragging: !double,
+                };
+                if double {
+                    let line = self.notes_line(pos.0);
+                    let word = |c: &char| !c.is_whitespace();
+                    let chars: Vec<char> = line.chars().collect();
+                    if chars.get(pos.1).is_some_and(word) {
+                        let start = chars[..pos.1]
+                            .iter()
+                            .rposition(|c| !word(c))
+                            .map_or(0, |i| i + 1);
+                        let end = chars[pos.1..]
+                            .iter()
+                            .position(|c| !word(c))
+                            .map_or(chars.len(), |i| pos.1 + i);
+                        sel.anchor = (pos.0, start);
+                        sel.cursor = (pos.0, end - 1);
+                        self.notes_sel = Some(sel);
+                        self.copy_notes_sel();
+                    }
+                    return None;
+                }
+                self.notes_sel = Some(sel);
+                return None;
+            }
             return double.then(|| key(KeyCode::Enter)).flatten();
         }
         if self.hits.input.contains(at) && !scroll {
             self.focus = Focus::List;
         }
         None
+    }
+
+    // (line, char) of the notes under the pointer; with clamp, the nearest
+    // one when the pointer is outside of them
+    fn notes_at(&self, at: Position, clamp: bool) -> Option<(usize, usize)> {
+        let rows = &self.hits.notes;
+        let (first, last) = (rows.first()?, rows.last()?);
+        let row = match rows.iter().find(|r| r.0 == at.y) {
+            Some(row) => row,
+            None if !clamp => return None,
+            None if at.y < first.0 => return Some((first.1, first.2)),
+            None => {
+                return Some((last.1, last.2 + last.3.chars().count()));
+            }
+        };
+        let dx = usize::from(at.x.saturating_sub(self.hits.notes_x));
+        if !clamp && (at.x < self.hits.notes_x || dx >= unicode_width(&row.3))
+        {
+            return None;
+        }
+        let mut width = 0;
+        let mut n = 0;
+        for c in row.3.chars() {
+            width += unicode_width(&c.to_string());
+            if width > dx {
+                break;
+            }
+            n += 1;
+        }
+        Some((row.1, row.2 + n))
+    }
+
+    fn notes_line(&self, line: usize) -> String {
+        self.selected()
+            .and_then(|e| self.details.get(&e.id))
+            .and_then(|d| d.notes.as_deref())
+            .and_then(|notes| notes.lines().nth(line))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn copy_notes_sel(&mut self) {
+        let text = self.selected().and_then(|e| {
+            let sel = self.notes_sel.as_ref().filter(|s| s.id == e.id)?;
+            Some(sel.text(self.details.get(&e.id)?.notes.as_deref()?))
+        });
+        self.copy("part of the notes", text);
     }
 
     // a click on a line of the popup: the first click selects a row, the
@@ -2183,6 +2341,8 @@ impl App {
 
     fn draw_details(&mut self, f: &mut ratatui::Frame, area: Rect) {
         self.hits.fields.clear();
+        self.hits.notes.clear();
+        self.hits.notes_x = area.x + 1;
         let border = if self.focus == Focus::Details {
             ACCENT
         } else {
@@ -2198,6 +2358,9 @@ impl App {
         let mut lines = vec![];
         // the field each line shows, for the mouse
         let mut tags: Vec<Option<usize>> = vec![];
+        // (index in lines, line of the notes, first char, text)
+        let mut note_rows: Vec<(usize, usize, usize, String)> = vec![];
+        let width = usize::from(area.width.saturating_sub(2)).max(1);
         if let Some(deleted) = &entry.deleted {
             lines.push(Line::from(Span::styled(
                 format!("in the trash since {}", day(deleted)),
@@ -2317,12 +2480,50 @@ impl App {
                     ));
                     // notes often hold keys and recovery codes: hidden
                     // like the other secrets until ^R
+                    // cut here to the width of the pane, so that the mouse
+                    // knows which char is where
                     if self.reveal {
-                        for l in value.lines() {
-                            lines.push(Line::from(Span::styled(
-                                l.to_string(),
-                                style,
-                            )));
+                        let sel = self
+                            .notes_sel
+                            .as_ref()
+                            .filter(|s| s.id == entry.id)
+                            .filter(|s| s.anchor != s.cursor || !s.dragging);
+                        for (ln, l) in value.lines().enumerate() {
+                            let chars: Vec<char> = l.chars().collect();
+                            let marked =
+                                sel.and_then(|s| s.on_line(ln, chars.len()));
+                            for (start, end) in wrap_chars(&chars, width) {
+                                let mut spans = vec![];
+                                let mut cut = |a: usize, b: usize, st| {
+                                    if a < b {
+                                        spans.push(Span::styled(
+                                            chars[a..b]
+                                                .iter()
+                                                .collect::<String>(),
+                                            st,
+                                        ));
+                                    }
+                                };
+                                match marked {
+                                    Some((a, b)) if a < end && b > start => {
+                                        let (a, b) =
+                                            (a.max(start), b.min(end));
+                                        let rev = style
+                                            .add_modifier(Modifier::REVERSED);
+                                        cut(start, a, style);
+                                        cut(a, b, rev);
+                                        cut(b, end, style);
+                                    }
+                                    _ => cut(start, end, style),
+                                }
+                                note_rows.push((
+                                    lines.len(),
+                                    ln,
+                                    start,
+                                    chars[start..end].iter().collect(),
+                                ));
+                                lines.push(Line::from(spans));
+                            }
                         }
                     } else {
                         lines.push(Line::from(Span::styled(
@@ -2383,8 +2584,8 @@ impl App {
         }
 
         // where each field ends up once the lines are wrapped
-        let width = usize::from(area.width.saturating_sub(2)).max(1);
         let mut fields = vec![];
+        let mut ys = vec![];
         let mut y = area.y + 1;
         for (line, tag) in lines.iter().zip(&tags) {
             let h = u16::try_from(line.width().div_ceil(width).max(1))
@@ -2392,21 +2593,45 @@ impl App {
             if let Some(n) = tag {
                 fields.push((y, h, *n));
             }
+            ys.push(y);
             y = y.saturating_add(h);
         }
         // scrolled just enough to show the selected field (entries can have
-        // dozens of uris, with the attachments after them)
+        // dozens of uris, with the attachments after them), all of it when
+        // it fits, else its top
         let bottom = area.y + area.height.saturating_sub(1);
-        let scroll = fields
+        let top = area.y + 1;
+        let mut scroll = if self.focus == Focus::Details
+            && self.detail_scroll.0 == entry.id
+        {
+            self.detail_scroll.1
+        } else {
+            0
+        };
+        let rows = fields
             .iter()
-            .find(|(_, _, n)| {
+            .filter(|(_, _, n)| {
                 self.focus == Focus::Details && *n == self.detail_line
             })
-            .map_or(0, |(y, h, _)| (y + h).saturating_sub(bottom));
+            .map(|(y, h, _)| (*y, y + h));
+        if let Some((first, end)) =
+            rows.reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+        {
+            scroll = scroll.max(end.saturating_sub(bottom));
+            scroll = scroll.min(first.saturating_sub(top));
+        }
+        let scrolled = (entry.id.clone(), scroll);
         let fields = fields
             .into_iter()
             .filter(|(y, _, _)| y.saturating_sub(scroll) > area.y)
             .map(|(y, h, n)| (y - scroll, h, n))
+            .collect();
+        let note_rows: Vec<_> = note_rows
+            .into_iter()
+            .filter_map(|(i, ln, start, text)| {
+                let y = ys.get(i)?.checked_sub(scroll)?;
+                (y > area.y && y < bottom).then_some((y, ln, start, text))
+            })
             .collect();
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -2416,6 +2641,8 @@ impl App {
             area,
         );
         self.hits.fields = fields;
+        self.hits.notes = note_rows;
+        self.detail_scroll = scrolled;
     }
 
     fn draw_footer(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -3043,6 +3270,10 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) -> Rect {
         ("^W  Alt-⌫", "delete word, clear filter"),
         ("Esc  ^C", "clear filter / quit"),
         ("mouse", "click selects, double or right click = Enter"),
+        (
+            "",
+            "drag on shown notes copies that part, double click a word",
+        ),
     ];
     let mut lines: Vec<Line> = rows
         .iter()
@@ -3088,4 +3319,21 @@ fn ago(d: std::time::Duration) -> String {
 
 fn unicode_width(s: &str) -> usize {
     ratatui::text::Span::raw(s).width()
+}
+
+// cuts a line into rows of at most width columns: (first, end) char indexes;
+// an empty line is one empty row
+fn wrap_chars(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+    let mut rows = vec![];
+    let (mut start, mut w) = (0, 0);
+    for (i, c) in chars.iter().enumerate() {
+        let cw = unicode_width(&c.to_string());
+        if w + cw > width && i > start {
+            rows.push((start, i));
+            (start, w) = (i, 0);
+        }
+        w += cw;
+    }
+    rows.push((start, chars.len()));
+    rows
 }

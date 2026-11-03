@@ -535,6 +535,18 @@ if command -v tmux >/dev/null; then
     click ' the favorites'
     check "  a click on a row does it" 0 "$(wait_screen 'ed to the favorites\|ed from the favorites' ; echo $?)"
     check "  on the server" "$([ "$was" = true ] && echo false || echo true)" "$(item flags .favorite)"
+    # the notes, shown: a drag copies what it covers, a double click a word
+    tmux send-keys -t rbw-e2e C-r
+    # down to them, after the uris, with the wheel on the details
+    for _ in $(seq 1 60); do screen | grep -q 'nota flags' && break; wheel 65 '120;10'; done
+    at=$(pos 'nota flags'); x=${at%;*}; y=${at#*;}
+    tmux send-keys -t rbw-e2e -l $'\e[<0;'"$x;$y"M$'\e[<32;'"$((x + 2));$y"M$'\e[<32;'"$((x + 3));$y"M$'\e[<0;'"$((x + 3));$y"m
+    check "  a drag on the notes copies that part" 0 "$(wait_screen 'part of the notes of flags copied' ; echo $?)"
+    if command -v wl-paste >/dev/null && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        check "  just that part" nota "$(wl-paste -n)"
+        press 0 "$((x + 6));$y"; press 0 "$((x + 6));$y"
+        check "  a double click copies a word" flags "$(sleep 0.3; wl-paste -n)"
+    fi
     tmux kill-session -t rbw-e2e 2>/dev/null || true
 
     # typing: a fake Hyprland that logs where the focus goes, a fake dotool
