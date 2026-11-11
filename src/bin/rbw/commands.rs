@@ -1322,6 +1322,10 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.attachments_dir =
                 (!value.is_empty()).then(|| std::path::PathBuf::from(value));
         }
+        "after_typing" => {
+            config.after_typing =
+                value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1355,6 +1359,9 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         }
         "sort_by_usage" => config.sort_by_usage = false,
         "attachments_dir" => config.attachments_dir = None,
+        "after_typing" => {
+            config.after_typing = rbw::config::AfterTyping::default();
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1373,8 +1380,9 @@ const LIVE_KEYS: &[&str] = &[
     "tui_auth",
     "sort_by_usage",
     "notify",
-    // read by the tui when it saves, the agent doesn't use it
+    // read by the tui, the agent doesn't use them
     "attachments_dir",
+    "after_typing",
 ];
 
 fn apply_config(key: &str) -> anyhow::Result<()> {

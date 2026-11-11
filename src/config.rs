@@ -61,6 +61,9 @@ pub struct Config {
     // where the tui saves attachments; unset, the user's download folder
     #[serde(default)]
     pub attachments_dir: Option<std::path::PathBuf>,
+    // what the tui does after typing a value into the previous window
+    #[serde(default)]
+    pub after_typing: AfterTyping,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
     pub device_id: Option<String>,
@@ -90,6 +93,7 @@ impl Default for Config {
             tui_auth: false,
             sort_by_usage: false,
             attachments_dir: None,
+            after_typing: AfterTyping::default(),
             device_id: None,
         }
     }
@@ -121,6 +125,49 @@ impl std::str::FromStr for TimeoutAction {
             "forget" | "logout" => Ok(Self::Forget),
             _ => Err(format!("expected lock or forget, got '{s}'")),
         }
+    }
+}
+
+// quit like rofi-rbw, stay open, or stay open out of sight (Hyprland's
+// special workspace, sway's scratchpad; elsewhere the same as stay)
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum AfterTyping {
+    #[default]
+    Quit,
+    Stay,
+    Hide,
+}
+
+impl AfterTyping {
+    pub const ALL: [Self; 3] = [Self::Quit, Self::Stay, Self::Hide];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::Stay => "stay",
+            Self::Hide => "hide",
+        }
+    }
+}
+
+impl std::str::FromStr for AfterTyping {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.name() == s)
+            .ok_or_else(|| format!("expected quit, stay or hide, got '{s}'"))
     }
 }
 

@@ -17,7 +17,7 @@ official apps. Based on [rbw](https://github.com/doy/rbw) by Jesse Luehrs.
 * **Replaces the official desktop client** for daily use, and **rofi-rbw** if
   you like: the TUI copies and also types credentials into the previous
   window.
-* Tested against Vaultwarden 1.37: `tests/vw/e2e.sh` runs 168 checks against
+* Tested against Vaultwarden 1.37: `tests/vw/e2e.sh` runs 179 checks against
   a throwaway server and verifies every write with an independent decryptor.
 
 ![rbw tui](docs/screenshots/main.png)
@@ -49,7 +49,8 @@ most come first.
 | Keys | |
 |---|---|
 | `^P` `^U` `^T` | copy password, username, TOTP code (cleared after 30 s) |
-| `Alt+P` `Alt+U` `Alt+T` | type them into the previous window and quit, like rofi-rbw |
+| `Alt+P` `Alt+U` `Alt+T` | type them into the previous window, like rofi-rbw (see below) |
+| `Alt+A` | type username, Tab, password: a whole login form |
 | `Enter` | menu with every action on the entry; on a field (`Tab`), copy or type it; on an attachment, save or open it |
 | `←` | sidebar: favorites, types, vaults, collections, folders, archive, trash |
 | `^N` | new item: login, card, identity, secure note or SSH key, in your vault or an organization's collection |
@@ -57,7 +58,7 @@ most come first.
 | `^F` `^A` | favorite, archive |
 | `^G` | password generator |
 | `^R` `^O` `^S` `^L` | show secrets, open the URL, sync, lock |
-| `F2` | settings: security (see below) and the attachments folder |
+| `F2` | settings: security (see below), the attachments folder, after typing |
 
 Attachments are the last rows of the fields (`Tab`, then `End`). Saving one
 puts it in your download folder (`XDG_DOWNLOAD_DIR`, or the one set with
@@ -74,8 +75,32 @@ click copies a word; Shift+drag still selects text in most terminals.
 ![actions](docs/screenshots/actions.png)
 ![new item](docs/screenshots/new-item.png)
 
-Typing gives the focus back with the compositor (Hyprland, niri) and types
-with `dotool`, `wtype`, `ydotool` or `xdotool`, whichever is installed.
+Typing types with `dotool`, `wtype`, `ydotool` or `xdotool`, whichever is
+installed (on KDE Wayland `wtype` doesn't work: use `dotool` or `ydotool`).
+Then the TUI quits, like rofi-rbw; `after_typing` (`F2` or `rbw config set
+after_typing quit|stay|hide`) can keep it open instead:
+
+* **Hyprland, niri, sway**: the focus goes back to the previous window
+  through the compositor. `stay` keeps the TUI open; `hide` also moves its
+  window out of sight, so that a floating one doesn't cover the window typed
+  into: to the special workspace `special:rbw` on Hyprland, to the
+  scratchpad on sway (`scratchpad show` brings it back); niri has neither,
+  there `hide` is `stay`.
+* **elsewhere** (KDE, GNOME...): the TUI always quits first, its window
+  closes, the desktop gives the focus back by itself and a detached `rbw`
+  types. That needs the TUI in its own window (`konsole -e rbw tui`):
+  started from a shell, typing is refused, or the value would land in the
+  terminal.
+
+With `hide` on Hyprland a shortcut can bring the TUI back, for example
+(hyprlang syntax):
+
+```sh
+addr=$(hyprctl clients -j | jq -r '[.[] | select(.class == "rbw-tui")] | first | .address // empty')
+if [ -z "$addr" ]; then exec foot --app-id rbw-tui rbw tui; fi
+ws=$(hyprctl activeworkspace -j | jq -r .id)
+hyprctl dispatch movetoworkspace "$ws,address:$addr"   # back here, focused
+```
 
 ## Unlocking
 

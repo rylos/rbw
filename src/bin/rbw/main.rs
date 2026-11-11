@@ -271,6 +271,10 @@ enum Opt {
     #[command(about = "Update the local copy of the Bitwarden database")]
     Sync,
 
+    // the tui's typing on desktops without a way to give the focus back
+    #[command(name = "type-after-exit", hide = true)]
+    TypeAfterExit,
+
     #[command(about = "Search the vault interactively and copy values")]
     Tui {
         #[arg(long, help = "Start on the security settings")]
@@ -640,6 +644,7 @@ impl Opt {
             Self::ForgetPassword => "forget-password".to_string(),
             Self::Sync => "sync".to_string(),
             Self::Tui { .. } => "tui".to_string(),
+            Self::TypeAfterExit => "type-after-exit".to_string(),
             Self::List { .. } => "list".to_string(),
             Self::Get { .. } => "get".to_string(),
             Self::Search { .. } => "search".to_string(),
@@ -746,6 +751,7 @@ fn main() {
         Opt::ForgetPassword => commands::forget_password(),
         Opt::Sync => commands::sync(),
         Opt::Tui { settings } => tui::run(settings),
+        Opt::TypeAfterExit => typer::type_after_exit_child(),
         Opt::List { fields, raw } => commands::list(&fields, raw),
         Opt::Get {
             find_args,

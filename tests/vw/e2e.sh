@@ -555,32 +555,77 @@ if command -v tmux >/dev/null; then
     cat >"$WORK/typer/hyprctl" <<EOF
 #!/bin/sh
 if [ "\$1" = clients ]; then
-    echo '[{"address":"0xaaa","focusHistoryID":0},{"address":"0xbbb","focusHistoryID":1}]'
+    echo '[{"address":"0xaaa","focusHistoryID":0,"floating":true},{"address":"0xbbb","focusHistoryID":1,"floating":false}]'
 else
     echo "\$*" >>"$WORK/focus.log"; echo ok
 fi
 EOF
     printf '#!/bin/sh\ncat >>%s/typed.log\n' "$WORK" >"$WORK/typer/dotool"
     chmod +x "$WORK/typer/hyprctl" "$WORK/typer/dotool"
-    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env PATH='$WORK/typer:$PATH' HYPRLAND_INSTANCE_SIGNATURE=fake RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
-    wait_screen "/$(rbw list | wc -l)\$" >/dev/null
-    tmux send-keys -t rbw-e2e 'flags'
-    wait_screen ' 1/' >/dev/null
+    start_typer() { # $1: extra env
+        tmux new-session -d -s rbw-e2e -x 140 -y 40 "env -u HYPRLAND_INSTANCE_SIGNATURE -u NIRI_SOCKET -u SWAYSOCK $1 PATH='$WORK/typer:$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+        wait_screen "/$(rbw list | wc -l)\$" >/dev/null
+        tmux send-keys -t rbw-e2e 'flags'
+        wait_screen ' 1/' >/dev/null
+    }
+    gone() { for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done; tmux has-session -t rbw-e2e 2>/dev/null; echo $?; }
+    start_typer HYPRLAND_INSTANCE_SIGNATURE=fake
     tmux send-keys -t rbw-e2e Enter
     check "Enter opens the actions" 0 "$(wait_screen 'type password  *Alt+P' ; echo $?)"
+    check "  with Alt+A" 0 "$(wait_screen 'type username, Tab, password  *Alt+A' ; echo $?)"
     tmux send-keys -t rbw-e2e Escape
     sleep 0.2
     tmux send-keys -t rbw-e2e M-p
-    for _ in $(seq 1 30); do tmux has-session -t rbw-e2e 2>/dev/null || break; sleep 0.1; done
-    check "Alt+P gives the focus back to the previous window" 1 "$(grep -c 0xbbb "$WORK/focus.log" 2>/dev/null)"
+    check "Alt+P quits by default" 1 "$(gone)"
+    check "  gives the focus back to the previous window" 1 "$(grep -c 0xbbb "$WORK/focus.log" 2>/dev/null)"
     check "  types the password there" "type $(rbw get flags)" "$(cat "$WORK/typed.log" 2>/dev/null)"
-    check "  and quits" 1 "$(tmux has-session -t rbw-e2e 2>/dev/null; echo $?)"
-    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env -u HYPRLAND_INSTANCE_SIGNATURE -u NIRI_SOCKET PATH='$WORK/typer:$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' rbw tui"
+    check "  without hiding anything" 0 "$(grep -c special "$WORK/focus.log")"
+    check "after_typing takes quit, stay or hide" 1 "$(rbw config set after_typing later >/dev/null 2>&1; echo $?)"
+    rbw config set after_typing hide
+    : >"$WORK/typed.log"; : >"$WORK/focus.log"
+    start_typer HYPRLAND_INSTANCE_SIGNATURE=fake
+    tmux send-keys -t rbw-e2e M-p
+    check "after_typing hide: stays open" 0 "$(wait_screen 'typed password of flags' ; echo $?)"
+    check "  and hides its window" 1 "$(grep -c 'special:rbw.*0xaaa' "$WORK/focus.log" 2>/dev/null)"
+    : >"$WORK/typed.log"
+    tmux send-keys -t rbw-e2e M-a
+    check "Alt+A types username, Tab, password" "$(printf 'type u2\nkey tab\ntype %s' "$(rbw get flags)")" \
+        "$(sleep 1; cat "$WORK/typed.log" 2>/dev/null)"
+    tmux kill-session -t rbw-e2e 2>/dev/null || true
+    # sway: the focus order of the tree; the tui (10) floats over 20, focused
+    # before it
+    cat >"$WORK/typer/swaymsg" <<EOF
+#!/bin/sh
+if [ "\$2" = get_tree ]; then
+    echo '{"id":1,"type":"root","focus":[2],"nodes":[{"id":2,"type":"output","focus":[3],"nodes":[{"id":3,"type":"workspace","focus":[10,4],"nodes":[{"id":4,"type":"con","focus":[21,20],"nodes":[{"id":20,"type":"con","focus":[],"nodes":[]},{"id":21,"type":"con","focus":[],"nodes":[]}]}],"floating_nodes":[{"id":10,"type":"floating_con","focused":true,"focus":[],"nodes":[]}]}]}]}'
+else
+    echo "\$*" >>"$WORK/sway.log"; echo '[{"success":true}]'
+fi
+EOF
+    chmod +x "$WORK/typer/swaymsg"
+    : >"$WORK/typed.log"
+    start_typer SWAYSOCK=fake
+    tmux send-keys -t rbw-e2e M-p
+    check "sway: hides the tui in the scratchpad" 0 "$(wait_screen 'typed password of flags' >/dev/null; grep -c 'con_id=10. move scratchpad' "$WORK/sway.log" >/dev/null; echo $?)"
+    check "  focuses the window focused before" 1 "$(grep -c '^\[con_id=21\] focus' "$WORK/sway.log")"
+    check "  types there" "type $(rbw get flags)" "$(cat "$WORK/typed.log")"
+    tmux kill-session -t rbw-e2e 2>/dev/null || true
+    rbw config unset after_typing
+    # elsewhere (KDE...): quits, then a detached rbw types
+    : >"$WORK/typed.log"
+    start_typer ""
+    tmux send-keys -t rbw-e2e M-u
+    check "other desktops: quits" 1 "$(gone)"
+    check "  then types" "type u2" "$(sleep 1.5; cat "$WORK/typed.log")"
+    # but not from a shell, where the terminal would get the value
+    tmux new-session -d -s rbw-e2e -x 140 -y 40 "env -u HYPRLAND_INSTANCE_SIGNATURE -u NIRI_SOCKET -u SWAYSOCK PATH='$WORK/typer:$PATH' RBW_PROFILE=rbwtest RBW_TEST_PIN='$PW' bash --norc -i"
+    sleep 0.5
+    tmux send-keys -t rbw-e2e 'rbw tui' Enter
     wait_screen "/$(rbw list | wc -l)\$" >/dev/null
     tmux send-keys -t rbw-e2e 'flags'
     wait_screen ' 1/' >/dev/null
     tmux send-keys -t rbw-e2e M-u
-    check "without Hyprland or niri it refuses to type" 0 "$(wait_screen 'typing needs Hyprland' ; echo $?)"
+    check "  refused from a shell" 0 "$(wait_screen 'typing needs the tui in its own window' ; echo $?)"
     tmux kill-session -t rbw-e2e 2>/dev/null || true
 
     # attachments: saved in attachments_dir, never over an existing file;

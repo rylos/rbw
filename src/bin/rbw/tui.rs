@@ -257,7 +257,8 @@ enum Outcome {
     ),
     // a request to the server: the message stays on screen while it runs
     Work(String, Box<dyn FnOnce() -> anyhow::Result<String>>),
-    // (what, value): typed into the previous window, then the tui quits
+    // (what, value): typed into the previous window (a tab as the Tab key);
+    // then the tui quits, stays or hides, as after_typing says
     Type(String, String),
     Reload,
     None,
@@ -881,6 +882,17 @@ impl App {
                     return self.type_value("username", details.username);
                 }
             }
+            // a login form: username, Tab, password
+            KeyCode::Char('a') if alt => {
+                if let Some(details) = self.ensure_details() {
+                    let login = details
+                        .username
+                        .filter(|u| !u.is_empty())
+                        .zip(details.primary.filter(|p| !p.is_empty()))
+                        .map(|(u, p)| format!("{u}\t{p}"));
+                    return self.type_value("username and password", login);
+                }
+            }
             KeyCode::Char('t') if alt => {
                 if let Some(details) = self.ensure_details() {
                     let code = details
@@ -1114,12 +1126,36 @@ impl App {
                 Outcome::None => {}
                 Outcome::Type(what, value) => {
                     let id = self.selected().map(|e| e.id.clone());
-                    match crate::typer::type_into_previous_window(&value) {
+                    let after = rbw::config::Config::load()
+                        .unwrap_or_default()
+                        .after_typing;
+                    let hide = after == rbw::config::AfterTyping::Hide;
+                    // elsewhere the tui must go away first, see typer
+                    let after = if crate::typer::can_give_focus() {
+                        after
+                    } else {
+                        rbw::config::AfterTyping::Quit
+                    };
+                    let typed = if crate::typer::can_give_focus() {
+                        crate::typer::type_into_previous_window(&value, hide)
+                    } else {
+                        crate::typer::type_after_exit(&value)
+                    };
+                    match typed {
                         Ok(()) => {
                             if let Some(id) = id {
                                 rbw::usage::Usage::record(&id);
                             }
-                            self.quit = true;
+                            let name = self
+                                .selected()
+                                .map_or(String::new(), |e| e.name.clone());
+                            self.message(
+                                format!("typed {what} of {name}"),
+                                false,
+                            );
+                            if after == rbw::config::AfterTyping::Quit {
+                                self.quit = true;
+                            }
                         }
                         Err(e) => {
                             self.message(
@@ -1907,6 +1943,11 @@ impl App {
                 "Alt+U",
                 Act::Key(KeyCode::Char('u'), alt),
             ));
+            rows.push((
+                format!("type username, Tab, {main}"),
+                "Alt+A",
+                Act::Key(KeyCode::Char('a'), alt),
+            ));
         }
         if has_totp {
             rows.push((
@@ -2689,7 +2730,7 @@ impl App {
                 ("^P", &copy_main),
                 ("^U", "copy user"),
                 ("^T", "copy totp"),
-                ("Alt+P U T", "type"),
+                ("Alt+P U T A", "type"),
                 ("⇥", "fields"),
                 ("←", "views"),
                 ("^E", "edit"),
@@ -3059,6 +3100,7 @@ fn needs_secret(key: &KeyEvent) -> bool {
     match key.code {
         KeyCode::Enter | KeyCode::Tab | KeyCode::Right => true,
         KeyCode::Char('p' | 'u' | 't') => ctrl || alt,
+        KeyCode::Char('a') if alt => true,
         KeyCode::Char('r' | 'e' | 'n' | 'd' | 'f' | 'a') => ctrl,
         _ => false,
     }
@@ -3160,6 +3202,11 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, row: usize) -> Rect {
             },
             true,
         ),
+        (
+            "After typing".to_string(),
+            format!("‹ {} ›", settings.after_typing.name()),
+            true,
+        ),
     ];
     let mut lines = vec![];
     for (n, (label, value, enabled)) in rows.iter().enumerate() {
@@ -3255,8 +3302,9 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) -> Rect {
         ("^U  ^T", "copy username, totp code"),
         (
             "Alt+P Alt+U Alt+T",
-            "type them into the previous window, and quit",
+            "type them into the previous window (F2: then quit or stay)",
         ),
+        ("Alt+A", "type username, Tab, password (a login form)"),
         ("^R", "show or hide secrets"),
         ("^O", "open the web address"),
         ("← ⇧Tab", "views: favorites, types, vaults, folders, trash"),
