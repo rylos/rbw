@@ -627,7 +627,21 @@ impl Item {
         // bitwarden.com returns the whole encrypted item again as one
         // "data" string, and when an update carries it, it stores that and
         // ignores name, notes, login and the rest, so a changed value would
-        // be dropped; without it the server builds "data" from the fields
+        // be dropped; without it the server builds "data" from the fields.
+        // A blob-encrypted item keeps all its content in "data" (a JSON
+        // object with "format_version") and none in the fields: dropping it
+        // would empty the item, so such items are not edited.
+        if string(&self.json, "data")
+            .and_then(|data| {
+                serde_json::from_str::<serde_json::Value>(&data).ok()
+            })
+            .is_some_and(|data| data.get("format_version").is_some())
+        {
+            anyhow::bail!(
+                "this entry uses Bitwarden's newer encrypted format, which rbw \
+                 can't edit yet; edit it in an official client"
+            );
+        }
         if let Some(json) = self.json.as_object_mut() {
             json.remove("data");
         }
