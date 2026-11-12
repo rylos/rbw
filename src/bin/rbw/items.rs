@@ -624,6 +624,13 @@ impl Item {
         if let Some(revision_date) = self.json.get("revisionDate").cloned() {
             self.json["lastKnownRevisionDate"] = revision_date;
         }
+        // bitwarden.com returns the whole encrypted item again as one
+        // "data" string, and when an update carries it, it stores that and
+        // ignores name, notes, login and the rest, so a changed value would
+        // be dropped; without it the server builds "data" from the fields
+        if let Some(json) = self.json.as_object_mut() {
+            json.remove("data");
+        }
         let json = self.json.clone();
         api_call(|client, access_token| {
             let mut json = json.clone();
