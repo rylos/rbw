@@ -112,6 +112,18 @@ echo pw-k | rbw edit keyed --password-stdin --hidden-field new=v --notes changed
 check "keyed entry still decrypts, passkey and favorite kept" \
     '{"keyed":true,"favorite":true,"password":"pw-k","passkeys":1,"history":["kp"],"notes":"changed"}' \
     "$(item keyed '{keyed, favorite, password: .login.password, passkeys: .login.passkeys, history, notes}')"
+# notes alone: the password and its history stay as they were
+bw mkkeyed keyed2 >/dev/null
+rbw sync
+printf 'line one\nline two\n' >"$WORK/notes.txt"
+rbw edit "$(rbw get --raw keyed2 | jq -r .id)" --notes-file "$WORK/notes.txt"
+check "keyed entry: edit --notes-file by uuid changes only the notes" \
+    '{"keyed":true,"password":"kp","history":[],"notes":"line one\nline two"}' \
+    "$(item keyed2 '{keyed, password: .login.password, history, notes}')"
+rbw edit keyed2 --notes "plain notes"
+check "keyed entry: edit --notes" '"plain notes"' "$(item keyed2 .notes)"
+# mkkeyed makes a favorite, and the tui counts them
+rbw rm --permanent keyed2
 
 echo "== attachments"
 head -c 300000 /dev/urandom >"$WORK/bin.dat"
