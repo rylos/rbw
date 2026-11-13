@@ -17,12 +17,12 @@ export PATH="$ROOT/target/debug:$PATH"
 
 if [ "${1:-}" = stop ]; then
     rbw stop-agent 2>/dev/null || true
-    docker rm -f vw-dev >/dev/null 2>&1 || true
+    docker rm -fv vw-dev >/dev/null 2>&1 || true
     exit 0
 fi
 
 (cd "$ROOT" && cargo build -q)
-docker rm -f vw-dev >/dev/null 2>&1 || true
+docker rm -fv vw-dev >/dev/null 2>&1 || true
 docker run -d --name vw-dev --network host \
     -e ROCKET_ADDRESS=127.0.0.1 -e ROCKET_PORT=8223 \
     -e SIGNUPS_ALLOWED=true -e I_REALLY_WANT_VOLATILE_STORAGE=true \

@@ -14,10 +14,10 @@ OUT=$ROOT/docs/screenshots
 export RBW_PROFILE=rbwshot RBW_TEST_PIN=$PW
 export PATH="$ROOT/target/debug:$PATH"
 WORK=$(mktemp -d)
-trap 'rbw stop-agent 2>/dev/null || true; docker rm -f vw-shot >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+trap 'rbw stop-agent 2>/dev/null || true; docker rm -fv vw-shot >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 (cd "$ROOT" && cargo build -q)
-docker rm -f vw-shot >/dev/null 2>&1 || true
+docker rm -fv vw-shot >/dev/null 2>&1 || true
 docker run -d --name vw-shot --network host \
     -e ROCKET_ADDRESS=127.0.0.1 -e ROCKET_PORT=8224 \
     -e SIGNUPS_ALLOWED=true -e I_REALLY_WANT_VOLATILE_STORAGE=true \
