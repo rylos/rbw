@@ -16,7 +16,7 @@ URL=http://127.0.0.1:8222
 EMAIL=test@rbw.local
 PW=test-password-123
 WORK=$(mktemp -d)
-trap 'RBW_PROFILE=rbwtest "$ROOT/target/debug/rbw" stop-agent 2>/dev/null || true; docker rm -f vw-test >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+trap 'RBW_PROFILE=rbwtest "$ROOT/target/debug/rbw" stop-agent 2>/dev/null || true; docker rm -fv vw-test >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 export RBW_PROFILE=rbwtest
 export PATH="$WORK/bin:$ROOT/target/debug:$PATH"
@@ -51,7 +51,7 @@ printf '#!/bin/sh\necho "$*" >> %s/notify.log\n' "$WORK" >"$WORK/bin/notify-send
 chmod +x "$WORK/bin/notify-send"
 
 (cd "$ROOT" && cargo build -q)
-docker rm -f vw-test >/dev/null 2>&1 || true
+docker rm -fv vw-test >/dev/null 2>&1 || true
 # host networking: no port mapping, so no iptables DNAT rule, which docker
 # can't add after a kernel update until the next reboot
 docker run -d --name vw-test --network host \
