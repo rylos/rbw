@@ -1609,10 +1609,18 @@ const EDIT_HELP: &str = "\
 # Everything below the '--- notes ---' line is stored as the notes.
 ";
 
-fn render_form(form: &Form) -> String {
+const NOTE_HELP: &str = "\
+# Secure note: write or paste the text below the '--- notes ---' line.
+# With the name left empty, the first line of the text becomes the name.
+";
+
+fn render_form(form: &Form, kind: Kind) -> String {
     // writing to a String can't fail
     let mut out = String::new();
     out.push_str(EDIT_HELP);
+    if kind == Kind::Note {
+        out.push_str(NOTE_HELP);
+    }
     let _ = writeln!(out, "name: {}", form.name);
     if let Some(login) = &form.login {
         let _ = writeln!(
@@ -1666,18 +1674,49 @@ fn parse_form(contents: &str, kind: Kind) -> anyhow::Result<Form> {
     };
     let mut lines = contents.split('\n');
     let mut found_separator = false;
+    // a note's text pasted above the separator: from its first line that
+    // isn't one of the form's, it goes to the notes instead of failing
+    let mut pasted: Option<Vec<&str>> = None;
+    let help_lines: Vec<&str> =
+        EDIT_HELP.lines().chain(NOTE_HELP.lines()).collect();
     for (n, line) in lines.by_ref().enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line == NOTES_SEPARATOR {
             found_separator = true;
             break;
         }
+        if help_lines.contains(&line) || line.starts_with("# error: ") {
+            continue;
+        }
+        if let Some(pasted) = &mut pasted {
+            let form_line = line
+                .split_once(':')
+                .is_some_and(|(key, _)| matches!(key, "name" | "folder"));
+            if !form_line {
+                pasted.push(line);
+                continue;
+            }
+        }
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else {
+        let parsed = line.split_once(':').filter(|(key, _)| {
+            let key = key.trim();
+            kind != Kind::Note
+                || matches!(
+                    key,
+                    "name" | "folder" | "text" | "hidden" | "boolean"
+                )
+        });
+        let Some((key, value)) = parsed else {
+            if kind == Kind::Note {
+                pasted = Some(vec![line]);
+                continue;
+            }
+            // the line itself isn't repeated: it may hold a secret
             return Err(anyhow::anyhow!(
-                "line {}: expected 'key: value', got '{line}'",
+                "line {}: expected 'key: value' (the notes go below the \
+                 '{NOTES_SEPARATOR}' line)",
                 n + 1
             ));
         };
@@ -1749,8 +1788,26 @@ fn parse_form(contents: &str, kind: Kind) -> anyhow::Result<Form> {
             "the '{NOTES_SEPARATOR}' line is missing"
         ));
     }
-    let notes = lines.collect::<Vec<_>>().join("\n");
+    let mut notes = lines.collect::<Vec<_>>().join("\n");
+    if let Some(pasted) = pasted {
+        let pasted = pasted.join("\n");
+        let pasted = pasted.trim_matches(['\n', '\r']);
+        notes = if notes.trim().is_empty() {
+            pasted.to_string()
+        } else {
+            format!("{pasted}\n{notes}")
+        };
+    }
     form.notes = non_empty(notes.trim_end_matches(['\n', '\r']));
+    if form.name.trim().is_empty() && kind == Kind::Note {
+        if let Some(first) = form
+            .notes
+            .as_deref()
+            .and_then(|notes| notes.lines().find(|l| !l.trim().is_empty()))
+        {
+            form.name = first.trim().to_string();
+        }
+    }
     if form.name.trim().is_empty() {
         return Err(anyhow::anyhow!("the name can't be empty"));
     }
@@ -1777,9 +1834,19 @@ fn edit_form(
     ui: &mut dyn FnMut(Screen),
 ) -> anyhow::Result<Form> {
     ui(Screen::Terminal);
-    let mut contents = render_form(form);
+    let mut contents = render_form(form, kind);
     loop {
-        let edited = rbw::edit::edit(&contents, "")?;
+        // a note is mostly its text: start there, so that pasting lands in
+        // the notes
+        let line = (kind == Kind::Note)
+            .then(|| {
+                contents
+                    .lines()
+                    .position(|l| l == NOTES_SEPARATOR)
+                    .map(|i| i + 2)
+            })
+            .flatten();
+        let edited = rbw::edit::edit(&contents, "", line)?;
         match parse_form(&edited, kind) {
             Ok(form) => return Ok(form),
             Err(e) => {
@@ -1914,7 +1981,8 @@ mod tests {
     fn test_form_roundtrip() {
         let form = login_form();
         assert_eq!(
-            parse_form(&render_form(&form), Kind::Login).unwrap(),
+            parse_form(&render_form(&form, Kind::Login), Kind::Login)
+                .unwrap(),
             form
         );
 
@@ -1922,7 +1990,7 @@ mod tests {
         note.login = None;
         note.notes = None;
         assert_eq!(
-            parse_form(&render_form(&note), Kind::Note).unwrap(),
+            parse_form(&render_form(&note, Kind::Note), Kind::Note).unwrap(),
             note
         );
     }
@@ -1937,15 +2005,48 @@ mod tests {
         )
         .is_err());
         assert!(parse_form(
-            "name: x\nusername: y\n--- notes ---\n",
-            Kind::Note
-        )
-        .is_err());
-        assert!(parse_form(
             "name: x\nboolean: f = maybe\n--- notes ---\n",
             Kind::Login
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_note_text_above_the_separator() {
+        let empty = Form {
+            name: String::new(),
+            login: None,
+            typed: vec![],
+            folder: None,
+            fields: vec![],
+            notes: None,
+        };
+        let rendered = render_form(&empty, Kind::Note);
+        let text = "recovery kit\n\nGroup: pc\nPassword: not-a-secret\n  \
+                    restic -r <folder> snapshots";
+        // pasted between the folder line and the separator, name left empty
+        let pasted = rendered.replace(
+            &format!("\n{NOTES_SEPARATOR}\n"),
+            &format!("\n{text}\n{NOTES_SEPARATOR}\n"),
+        );
+        let form = parse_form(&pasted, Kind::Note).unwrap();
+        assert_eq!(form.name, "recovery kit");
+        assert_eq!(form.notes.as_deref(), Some(text));
+        // pasted at the very top: the form's own lines still count
+        let form =
+            parse_form(&format!("{text}\n{rendered}"), Kind::Note).unwrap();
+        assert_eq!(form.notes.as_deref(), Some(text));
+        // below the separator, as meant
+        let form =
+            parse_form(&format!("{rendered}{text}\n"), Kind::Note).unwrap();
+        assert_eq!(form.name, "recovery kit");
+        assert_eq!(form.notes.as_deref(), Some(text));
+        // a login still refuses it, without repeating the line
+        let err =
+            parse_form(&pasted.replace("name: \n", "name: x\n"), Kind::Login)
+                .unwrap_err()
+                .to_string();
+        assert!(!err.contains("recovery kit"), "{err}");
     }
 
     #[test]

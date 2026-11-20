@@ -4,7 +4,13 @@ use std::io::{Read as _, Write as _};
 
 use is_terminal::IsTerminal as _;
 
-pub fn edit(contents: &str, help: &str) -> Result<String> {
+// `line` puts the cursor on that line (1-based) in the editors known to
+// take it on the command line; the others open at the top as before
+pub fn edit(
+    contents: &str,
+    help: &str,
+    line: Option<usize>,
+) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         // directly read from piped content
         return match std::io::read_to_string(std::io::stdin()) {
@@ -40,31 +46,36 @@ pub fn edit(contents: &str, help: &str) -> Result<String> {
         let editor = std::path::Path::new(&editor);
         let mut editor_args = vec![];
 
-        #[allow(clippy::single_match_else)] // more to come
-        match editor.file_name() {
-            Some(editor) => match editor.to_str() {
-                Some("vim" | "nvim") => {
-                    // disable swap files and viminfo for password entry
-                    editor_args.push(std::ffi::OsString::from("-ni"));
-                    editor_args.push(std::ffi::OsString::from("NONE"));
-                    let script = dir.path().join("rbw.vim");
-                    if std::fs::write(&script, VIM_SCRIPT).is_ok() {
-                        editor_args.push(std::ffi::OsString::from("-S"));
-                        editor_args.push(script.into_os_string());
-                    }
-                }
-                _ => {
-                    // other editor support welcomed
-                }
-            },
-            None => {
-                return Err(Error::InvalidEditor {
-                    var: var.to_string(),
-                    editor: editor.as_os_str().to_os_string(),
-                })
+        let Some(name) = editor.file_name() else {
+            return Err(Error::InvalidEditor {
+                var: var.to_string(),
+                editor: editor.as_os_str().to_os_string(),
+            });
+        };
+        let name = name.to_str().unwrap_or_default();
+        if matches!(name, "vim" | "nvim") {
+            // disable swap files and viminfo for password entry
+            editor_args.push(std::ffi::OsString::from("-ni"));
+            editor_args.push(std::ffi::OsString::from("NONE"));
+            let script = dir.path().join("rbw.vim");
+            if std::fs::write(&script, VIM_SCRIPT).is_ok() {
+                editor_args.push(std::ffi::OsString::from("-S"));
+                editor_args.push(script.into_os_string());
             }
         }
-        editor_args.push(file.clone().into_os_string());
+        let mut file_arg = file.clone().into_os_string();
+        if let Some(line) = line {
+            match name {
+                "vi" | "vim" | "nvim" | "micro" | "nano" | "emacs"
+                | "kak" | "joe" | "ne" | "mcedit" => {
+                    editor_args
+                        .push(std::ffi::OsString::from(format!("+{line}")));
+                }
+                "hx" | "helix" => file_arg.push(format!(":{line}")),
+                _ => {}
+            }
+        }
+        editor_args.push(file_arg);
         (editor, editor_args)
     };
 
